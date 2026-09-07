@@ -1,0 +1,360 @@
+"""Anti-Collision Spec Normalizer for KALA-BALANA.
+
+Solves the variant-conflation problem: ``iPhone 16 Pro`` and
+``iPhone 16 Pro Max`` must NEVER share a ``spec_fingerprint``, even when
+a retailer's title mashes them together with marketing noise.
+
+Design principles
+-----------------
+* Pure functions — zero I/O, zero network, 100% unit-testable.
+* Deterministic: same logical product always produces the same fingerprint
+  regardless of input capitalization, punctuation, emoji, or marketing junk.
+* Conservative extraction: when a field cannot be reliably extracted it
+  defaults to an empty string rather than guessing (prevents false merges).
+
+Fingerprint formula
+-------------------
+    SHA-256( f"{brand}|{model_family}|{sub_model}|{ram_gb}|{storage_gb}|{region_code}".lower() )
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Noise patterns to strip before extraction
+# ---------------------------------------------------------------------------
+
+# Marketing junk phrases (case-insensitive, order matters for specificity).
+_JUNK_PHRASES: list[str] = [
+    r"\bfree\s+delivery\b",
+    r"\bfree\s+shipping\b",
+    r"\bfast\s+delivery\b",
+    r"\bone\s+year\s+warranty\b",
+    r"\b1\s+year\s+warranty\b",
+    r"\b2\s+year\s+warranty\b",
+    r"\bofficial\s+warranty\b",
+    r"\blocal\s+warranty\b",
+    r"\bauthorized\b",
+    r"\bgenuine\b",
+    r"\boriginal\b",
+    r"\bsealed\b",
+    r"\bnew\s+arrival\b",
+    r"\bhot\s+deal\b",
+    r"\bbest\s+price\b",
+    r"\bbest\s+deal\b",
+    r"\bspecial\s+offer\b",
+    r"\blimited\s+offer\b",
+    r"\bflash\s+sale\b",
+    r"\bclearance\b",
+    r"\bgift\b",
+    r"\bcombo\b",
+    r"\bset\b",
+    r"\bpack\b",
+    r"\bbundle\b",
+    r"\binstallment\b",
+    r"\beasypayment\b",
+    r"\bkoko\s+pay\b",
+    r"\bkoko\b",
+    r"\bmintpay\b",
+    r"\bmint\s+pay\b",
+    r"\bpayhere\b",
+    r"\bpay\b",
+    r"\bbnpl\b",
+    r"\bcredit\s+card\b",
+    r"\bcash\s+on\s+delivery\b",
+    r"\bcod\b",
+    r"\bon\s+sale\b",
+    r"\bdiscount\b",
+    r"\bup\s+to\s+\d+%\s+off\b",
+    r"\d+%\s+off\b",
+    r"\(import\s*set\)",
+    r"\(used\)",
+    r"\(refurbished\)",
+    r"\bex\s+stock\b",
+    r"\bpreorder\b",
+    r"\bpre-order\b",
+    r"\bpre\s+order\b",
+]
+_JUNK_RE = re.compile(
+    "|".join(_JUNK_PHRASES), re.IGNORECASE
+)
+
+# Emoji and non-ASCII decorative symbols.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U0001F900-\U0001F9FF"  # supplemental symbols
+    "\U00002600-\U000026FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+# Parenthetical noise not captured by junk phrases (e.g., "(Best!)").
+_PARENS_NOISE_RE = re.compile(r"\([^)]{0,60}\)")
+
+# Repeated punctuation / special chars used as decoration.
+_DECO_RE = re.compile(r"[★✓✅☆►•·\-]{2,}")
+
+# Collapse whitespace.
+_WS_RE = re.compile(r"\s+")
+
+
+# ---------------------------------------------------------------------------
+# Extraction patterns
+# ---------------------------------------------------------------------------
+
+# Known brand names. Ordered by likelihood for early-exit matching.
+_KNOWN_BRANDS: list[str] = [
+    "Apple", "Samsung", "Google", "OnePlus", "Xiaomi", "Redmi", "POCO",
+    "Oppo", "Vivo", "Realme", "Huawei", "Honor", "Sony", "Nokia", "Motorola",
+    "Lenovo", "Asus", "LG", "HTC", "Itel", "Tecno", "Infinix",
+    "Dell", "HP", "Acer", "MSI", "Razer", "Microsoft", "Toshiba",
+]
+_BRAND_RE = re.compile(
+    r"\b(" + "|".join(re.escape(b) for b in _KNOWN_BRANDS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Sub-model modifiers — order matters: longer/more-specific first.
+_SUBMODEL_PATTERNS: list[tuple[str, str]] = [
+    (r"\bPro\s+Max\b",    "Pro Max"),
+    (r"\bPro\s+Plus\b",   "Pro Plus"),
+    (r"\bUltra\b",        "Ultra"),
+    (r"\bPro\b",          "Pro"),
+    (r"\bPlus\b",         "Plus"),
+    (r"\bMax\b",          "Max"),
+    (r"\bLite\b",         "Lite"),
+    (r"\bFE\b",           "FE"),       # Fan Edition
+    (r"\bSE\b",           "SE"),       # Special Edition
+    (r"\bmini\b",         "mini"),
+    (r"\bEdge\b",         "Edge"),
+    (r"\bNote\b",         "Note"),
+    (r"\bFold\b",         "Fold"),
+    (r"\bFlip\b",         "Flip"),
+]
+_SUBMODEL_RES: list[tuple[re.Pattern, str]] = [
+    (re.compile(pat, re.IGNORECASE), canonical)
+    for pat, canonical in _SUBMODEL_PATTERNS
+]
+
+# RAM/Storage: "8/256GB", "8GB/256GB", "8/256", "256GB", "512 GB".
+_RAM_STORAGE_RE = re.compile(
+    r"(\d+)\s*[Gg][Bb]?\s*/\s*(\d+)\s*[Gg][Bb]"
+    r"|(\d+)\s*/\s*(\d+)\s*[Gg][Bb]",
+    re.IGNORECASE,
+)
+_STORAGE_ONLY_RE = re.compile(r"(\d+)\s*[Gg][Bb]", re.IGNORECASE)
+
+# Region / variant codes (post-strip, so marketing words are already gone).
+_REGION_RE = re.compile(
+    r"\b(CN|IN|HK|JP|US|KR|UK|EU|AU|SG|TH|MY|PH|AE|SA)\b",
+    re.IGNORECASE,
+)
+
+# Model number extractor (e.g., "Galaxy S25", "iPhone 16", "Pixel 9", "A55").
+# Looks for a series name followed by optional digit(s).
+_MODEL_NUM_RE = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][0-9]{0,2})?\s*\d{1,4}[a-z]?)\b"
+)
+
+
+# ---------------------------------------------------------------------------
+# Public data class
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class NormalizedSpec:
+    """Extracted, canonical product specification."""
+
+    brand: str              # e.g. "apple", "samsung" (lowercased)
+    model_family: str       # e.g. "iphone 16", "galaxy s25" (lowercased)
+    sub_model: str          # e.g. "pro max", "ultra", "" (lowercased)
+    ram_gb: Optional[int]   # e.g. 8, 12, None
+    storage_gb: Optional[int]  # e.g. 256, 512, None
+    region_code: str        # e.g. "cn", "us", "" (lowercased)
+    spec_fingerprint: str   # SHA-256 hex digest
+
+    @classmethod
+    def from_parts(
+        cls,
+        brand: str,
+        model_family: str,
+        sub_model: str,
+        ram_gb: Optional[int],
+        storage_gb: Optional[int],
+        region_code: str,
+    ) -> "NormalizedSpec":
+        """Compute fingerprint and return an immutable NormalizedSpec."""
+        fp = _compute_fingerprint(brand, model_family, sub_model, ram_gb, storage_gb, region_code)
+        return cls(
+            brand=brand.lower().strip(),
+            model_family=model_family.lower().strip(),
+            sub_model=sub_model.lower().strip(),
+            ram_gb=ram_gb,
+            storage_gb=storage_gb,
+            region_code=region_code.lower().strip(),
+            spec_fingerprint=fp,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core normalizer class
+# ---------------------------------------------------------------------------
+
+class SpecNormalizer:
+    """Strips noise and deterministically extracts product spec fields."""
+
+    def normalize(
+        self,
+        raw_title: str,
+        brand_hint: Optional[str] = None,
+    ) -> NormalizedSpec:
+        """Normalize ``raw_title`` into a ``NormalizedSpec``.
+
+        Parameters
+        ----------
+        raw_title:
+            The product title exactly as scraped from the retailer page.
+        brand_hint:
+            Optional brand name pre-extracted by the LLM (``ScrapedProductItem.brand``).
+            Used as a fallback when the brand regex fails on unusual titles.
+        """
+        cleaned = self._strip_noise(raw_title)
+        brand = self._extract_brand(cleaned, brand_hint)
+        sub_model = self._extract_sub_model(cleaned)
+        ram_gb, storage_gb = self._extract_memory(cleaned)
+        region_code = self._extract_region(cleaned)
+        model_family = self._extract_model_family(cleaned, brand, sub_model)
+
+        return NormalizedSpec.from_parts(
+            brand=brand,
+            model_family=model_family,
+            sub_model=sub_model,
+            ram_gb=ram_gb,
+            storage_gb=storage_gb,
+            region_code=region_code,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Internal extraction helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _strip_noise(title: str) -> str:
+        """Remove emoji, marketing junk, decorative noise, and excess whitespace."""
+        s = _EMOJI_RE.sub(" ", title)
+        s = _JUNK_RE.sub(" ", s)
+        s = _PARENS_NOISE_RE.sub(" ", s)
+        s = _DECO_RE.sub(" ", s)
+        return _WS_RE.sub(" ", s).strip()
+
+    @staticmethod
+    def _extract_brand(cleaned: str, brand_hint: Optional[str]) -> str:
+        m = _BRAND_RE.search(cleaned)
+        if m:
+            return m.group(1).lower()
+        if brand_hint:
+            return brand_hint.strip().lower()
+        return ""
+
+    @staticmethod
+    def _extract_sub_model(cleaned: str) -> str:
+        """Return the first matching sub-model modifier (longest match wins)."""
+        for pattern, canonical in _SUBMODEL_RES:
+            if pattern.search(cleaned):
+                return canonical.lower()
+        return ""
+
+    @staticmethod
+    def _extract_memory(cleaned: str) -> tuple[Optional[int], Optional[int]]:
+        """Return (ram_gb, storage_gb). Both may be None."""
+        m = _RAM_STORAGE_RE.search(cleaned)
+        if m:
+            if m.group(1) and m.group(2):  # first alternation: Xgb/Ygb
+                return int(m.group(1)), int(m.group(2))
+            if m.group(3) and m.group(4):  # second alternation: X/Ygb
+                return int(m.group(3)), int(m.group(4))
+        # No RAM/storage pair — look for a lone storage spec.
+        m2 = _STORAGE_ONLY_RE.search(cleaned)
+        if m2:
+            return None, int(m2.group(1))
+        return None, None
+
+    @staticmethod
+    def _extract_region(cleaned: str) -> str:
+        m = _REGION_RE.search(cleaned)
+        return m.group(1).lower() if m else ""
+
+    @staticmethod
+    def _extract_model_family(cleaned: str, brand: str, sub_model: str) -> str:
+        """Best-effort model family extraction.
+
+        Strategy:
+        1. Remove the brand token from the cleaned title.
+        2. Remove the sub_model token.
+        3. Remove any storage/RAM tokens.
+        4. Extract the remaining "core" (first noun + number cluster).
+        """
+        s = cleaned
+        # Remove brand prefix.
+        if brand:
+            s = re.sub(r"\b" + re.escape(brand) + r"\b", "", s, flags=re.IGNORECASE)
+        # Remove sub-model modifier.
+        if sub_model:
+            s = re.sub(r"\b" + re.escape(sub_model) + r"\b", "", s, flags=re.IGNORECASE)
+        # Remove memory specs.
+        s = _RAM_STORAGE_RE.sub("", s)
+        s = _STORAGE_ONLY_RE.sub("", s)
+        # Remove region codes.
+        s = _REGION_RE.sub("", s)
+        # Strip trailing punctuation and normalize.
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = _WS_RE.sub(" ", s).strip().lower()
+        # Take the first 5 tokens as the model family to avoid bloat.
+        tokens = s.split()
+        return " ".join(tokens[:5])
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint computation
+# ---------------------------------------------------------------------------
+
+def _compute_fingerprint(
+    brand: str,
+    model_family: str,
+    sub_model: str,
+    ram_gb: Optional[int],
+    storage_gb: Optional[int],
+    region_code: str,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint from normalized spec fields.
+
+    The pipe-separated canonical string is lowercased before hashing so
+    casing differences in input never produce different fingerprints.
+    """
+    canonical = (
+        f"{brand.lower().strip()}"
+        f"|{model_family.lower().strip()}"
+        f"|{sub_model.lower().strip()}"
+        f"|{ram_gb if ram_gb is not None else ''}"
+        f"|{storage_gb if storage_gb is not None else ''}"
+        f"|{region_code.lower().strip()}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience instance
+# ---------------------------------------------------------------------------
+
+normalizer = SpecNormalizer()

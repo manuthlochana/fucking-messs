@@ -398,6 +398,21 @@ def main() -> None:
         except KeyboardInterrupt:
             log.warn("Demo interrupted by user.")
 
+    elif mode == "--dashboard":
+        port = 8000
+        if "--port" in args:
+            try:
+                p_idx = args.index("--port")
+                if p_idx + 1 < len(args):
+                    port = int(args[p_idx + 1])
+            except Exception:
+                pass
+        try:
+            from dashboard.app import start_dashboard
+            start_dashboard(host="0.0.0.0", port=port)
+        except KeyboardInterrupt:
+            log.warn("Dashboard stopped by user.")
+
     else:
         # Backward compatibility: bare URLs treated as --crawl targets.
         urls = [a for a in args_no_db if not a.startswith("--")]
@@ -413,8 +428,10 @@ def main() -> None:
                 "  python main.py --crawl <url> [url…] [--db]\n"
                 "  python main.py --worker --db\n"
                 "  python main.py --demo [--db]\n"
+                "  python main.py --dashboard [--port 8000]\n"
             )
             sys.exit(1)
+
 
 
 if __name__ == "__main__":

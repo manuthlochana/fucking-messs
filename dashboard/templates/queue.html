@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Forensic Queue Monitor — KALA-BALANA{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+            <h1 class="text-2xl font-bold text-white tracking-tight">Forensic Queue Monitor</h1>
+            <p class="text-sm text-slate-400 mt-1">Durable Postgres-backed serial work queue. Controlled at Concurrency=1 to prevent 4GB VPS memory exhaustion.</p>
+        </div>
+        <!-- Status Filter Tabs -->
+        <div class="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 p-1 rounded-lg text-xs font-mono">
+            <a href="/queue" class="px-3 py-1.5 rounded-md {% if not current_status %}bg-slate-800 text-emerald-400 font-semibold{% else %}text-slate-400 hover:text-white{% endif %}">All</a>
+            <a href="/queue?status=pending" class="px-3 py-1.5 rounded-md {% if current_status == 'pending' %}bg-slate-800 text-emerald-400 font-semibold{% else %}text-slate-400 hover:text-white{% endif %}">Pending</a>
+            <a href="/queue?status=claimed" class="px-3 py-1.5 rounded-md {% if current_status == 'claimed' %}bg-slate-800 text-emerald-400 font-semibold{% else %}text-slate-400 hover:text-white{% endif %}">In-Flight</a>
+            <a href="/queue?status=done" class="px-3 py-1.5 rounded-md {% if current_status == 'done' %}bg-slate-800 text-emerald-400 font-semibold{% else %}text-slate-400 hover:text-white{% endif %}">Done</a>
+            <a href="/queue?status=failed" class="px-3 py-1.5 rounded-md {% if current_status == 'failed' %}bg-slate-800 text-emerald-400 font-semibold{% else %}text-slate-400 hover:text-white{% endif %}">Failed</a>
+        </div>
+    </div>
+
+    <!-- Table -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow">
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+                <thead class="bg-slate-950/60 border-b border-slate-800 text-slate-400 uppercase font-mono">
+                    <tr>
+                        <th class="py-3.5 px-4 font-semibold">Job ID</th>
+                        <th class="py-3.5 px-4 font-semibold">Target Canonical Product / URL</th>
+                        <th class="py-3.5 px-4 font-semibold">Queue Status</th>
+                        <th class="py-3.5 px-4 font-semibold">Timestamps</th>
+                        <th class="py-3.5 px-4 font-semibold">Diagnostics / Error</th>
+                        <th class="py-3.5 px-4 font-semibold text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800">
+                    {% for j in jobs %}
+                    <tr class="hover:bg-slate-800/40 transition">
+                        <td class="py-4 px-4 font-mono text-slate-400 font-semibold">#{{ j.id }}</td>
+                        <td class="py-4 px-4">
+                            {% if j.product_id %}
+                            <a href="/product/{{ j.product_id }}" class="font-bold text-white hover:text-emerald-400 block max-w-sm truncate">
+                                {{ j.clean_title or 'Master Product' }}
+                            </a>
+                            {% else %}
+                            <span class="font-bold text-white block max-w-sm truncate">{{ j.clean_title or 'Master Product' }}</span>
+                            {% endif %}
+                            <a href="{{ j.listing_url }}" target="_blank" class="text-[10px] text-slate-500 hover:text-slate-400 block max-w-sm truncate font-mono mt-0.5">
+                                {{ j.listing_url }}
+                            </a>
+                        </td>
+                        <td class="py-4 px-4">
+                            <span class="px-2.5 py-1 rounded text-[11px] font-mono font-bold uppercase
+                                {% if j.status == 'done' %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/30
+                                {% elif j.status == 'claimed' %}bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse
+                                {% elif j.status == 'pending' %}bg-blue-500/20 text-blue-400 border border-blue-500/30
+                                {% else %}bg-rose-500/20 text-rose-400 border border-rose-500/30{% endif %}">
+                                {{ j.status }}
+                            </span>
+                        </td>
+                        <td class="py-4 px-4 text-slate-400 font-mono space-y-0.5">
+                            <div>Queued: {{ j.enqueued_at.strftime("%H:%M:%S") if j.enqueued_at else '—' }}</div>
+                            {% if j.claimed_at %}
+                            <div>Claimed: {{ j.claimed_at.strftime("%H:%M:%S") }}</div>
+                            {% endif %}
+                            {% if j.completed_at %}
+                            <div>Done: {{ j.completed_at.strftime("%H:%M:%S") }}</div>
+                            {% endif %}
+                        </td>
+                        <td class="py-4 px-4 text-rose-400 max-w-xs truncate font-mono">
+                            {{ j.error_msg or '—' }}
+                        </td>
+                        <td class="py-4 px-4 text-right">
+                            {% if j.status == 'failed' or j.status == 'claimed' %}
+                            <form method="POST" action="/queue/retry/{{ j.id }}" class="inline">
+                                <button type="submit" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 font-mono font-semibold transition border border-slate-700">
+                                    Retry Job
+                                </button>
+                            </form>
+                            {% elif j.product_id %}
+                            <a href="/product/{{ j.product_id }}" class="text-xs text-slate-400 hover:text-white font-mono">Inspect &rarr;</a>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="py-12 text-center text-slate-500 font-mono">
+                            No queue jobs found for current filter.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

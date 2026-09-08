@@ -41,9 +41,11 @@ _DDL_STATEMENTS = [
             'phase4_done',
             'phase5_done',
             'complete',
-            'failed'
+            'failed',
+            'partial'
         );
-    EXCEPTION WHEN duplicate_object THEN NULL;
+    EXCEPTION WHEN duplicate_object THEN
+        ALTER TYPE pipeline_status ADD VALUE IF NOT EXISTS 'partial';
     END $$;
     """,
 
@@ -81,6 +83,7 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_cp_brand_model ON canonical_products (brand, model_family);",
     "CREATE INDEX IF NOT EXISTS idx_cp_pipeline_status ON canonical_products (pipeline_status);",
+    "CREATE INDEX IF NOT EXISTS idx_cp_pipeline_status_active ON canonical_products (pipeline_status) WHERE pipeline_status NOT IN ('complete');",
     "CREATE INDEX IF NOT EXISTS idx_cp_attributes ON canonical_products USING GIN (attributes);",
 
     # ── product_embeddings ─────────────────────────────────────────────────
@@ -120,17 +123,31 @@ _DDL_STATEMENTS = [
     # ── merchant_forensics ─────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS merchant_forensics (
-        id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        merchant_id             UUID NOT NULL REFERENCES merchants (id) ON DELETE CASCADE,
-        bnpl_surcharge_pct      NUMERIC(6,2),
-        cc_surcharge_pct        NUMERIC(6,2),
-        dark_patterns           JSONB NOT NULL DEFAULT '[]',
-        koko_mintpay_hidden_fees JSONB NOT NULL DEFAULT '{}',
-        raw_audit_data          JSONB NOT NULL DEFAULT '{}',
-        audited_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (merchant_id)  -- one forensic record per merchant (upsert)
+        id                             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        merchant_id                    UUID NOT NULL REFERENCES merchants (id) ON DELETE CASCADE,
+        physical_presence_verified     BOOLEAN,
+        physical_addresses             JSONB DEFAULT '[]',
+        operating_hours                JSONB DEFAULT '{}',
+        business_registry_name         TEXT,
+        business_registry_age_days     INTEGER,
+        domain_registration_age_days   INTEGER,
+        domain_lineage                 JSONB DEFAULT '[]',
+        warranty_claims_verified       BOOLEAN,
+        surcharge_map                  JSONB DEFAULT '{}',
+        dark_patterns_detected         JSONB DEFAULT '[]',
+        price_devaluation_lag_days_up  NUMERIC(5,2),
+        price_devaluation_lag_days_down NUMERIC(5,2),
+        reliability_score_override     NUMERIC(3,2),
+        bnpl_surcharge_pct             NUMERIC(6,2),
+        cc_surcharge_pct               NUMERIC(6,2),
+        dark_patterns                  JSONB NOT NULL DEFAULT '[]',
+        koko_mintpay_hidden_fees       JSONB NOT NULL DEFAULT '{}',
+        raw_audit_data                 JSONB NOT NULL DEFAULT '{}',
+        audited_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (merchant_id)
     );
     """,
+    "CREATE INDEX IF NOT EXISTS idx_mf_dark_patterns ON merchant_forensics USING GIN (dark_patterns_detected jsonb_path_ops);",
 
     # ── listings ───────────────────────────────────────────────────────────
     """
@@ -152,32 +169,43 @@ _DDL_STATEMENTS = [
     # ── defect_dossiers — one canonical dossier per product ───────────────
     """
     CREATE TABLE IF NOT EXISTS defect_dossiers (
-        canonical_product_id UUID PRIMARY KEY REFERENCES canonical_products (id) ON DELETE CASCADE,
-        defects              JSONB NOT NULL DEFAULT '[]',
-        source_count         INTEGER NOT NULL DEFAULT 0,
-        confidence_label     TEXT NOT NULL DEFAULT 'low',
-        astroturf_risk_score NUMERIC(4,3) NOT NULL DEFAULT 0.0,
-        generated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        canonical_product_id    UUID PRIMARY KEY REFERENCES canonical_products (id) ON DELETE CASCADE,
+        defects                 JSONB NOT NULL DEFAULT '[]',
+        source_count            INTEGER NOT NULL DEFAULT 0,
+        astroturf_risk_score    NUMERIC(4,3) NOT NULL DEFAULT 0.0,
+        sponsored_content_ratio NUMERIC(4,3) NOT NULL DEFAULT 0.0,
+        confidence_label        TEXT NOT NULL DEFAULT 'low',
+        generated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_dd_confidence ON defect_dossiers (confidence_label);",
+    "CREATE INDEX IF NOT EXISTS idx_dd_gin ON defect_dossiers USING GIN (defects jsonb_path_ops);",
 
     # ── component_teardowns (append-only) ─────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS component_teardowns (
         id                        BIGSERIAL PRIMARY KEY,
         product_id                UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
-        revision_label            TEXT NOT NULL,
-        component_changed         TEXT NOT NULL,
-        change_description        TEXT NOT NULL,
+        component_name            TEXT,
+        observed_revision         TEXT,
+        serial_range_start        TEXT,
+        serial_range_end          TEXT,
+        manufacture_date_range    DATERANGE,
         repairability_score       NUMERIC(4,2),
+        source_url                TEXT,
+        source_type               TEXT,
+        notes                     TEXT,
+        revision_label            TEXT,
+        component_changed         TEXT,
+        change_description        TEXT,
         teardown_source_url       TEXT,
         ifixit_score              NUMERIC(4,2),
         silent_revision_detected  BOOLEAN NOT NULL DEFAULT FALSE,
         recorded_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
+    "CREATE INDEX IF NOT EXISTS idx_teardowns_product ON component_teardowns (product_id);",
 
     # ── forensic_queue — durable inter-process work queue ─────────────────
     """
@@ -216,15 +244,39 @@ _DDL_STATEMENTS = [
         id                      BIGSERIAL,
         product_id              UUID NOT NULL REFERENCES canonical_products (id),
         global_msrp_usd         NUMERIC(10,2),
+        us_msrp_usd             NUMERIC(10,2),
+        eu_msrp_eur             NUMERIC(10,2),
+        uae_msrp_aed            NUMERIC(10,2),
+        india_msrp_inr          NUMERIC(12,2),
         cbsl_rate               NUMERIC(10,4),
+        fx_rate                 NUMERIC(10,4),
+        tariff_pct_applied      NUMERIC(5,2),
         true_landed_cost_lkr    NUMERIC(12,2),
+        landed_cost_lkr         NUMERIC(12,2),
         merchant_price_lkr      NUMERIC(12,2),
+        local_price_lkr         NUMERIC(12,2),
         markup_pct              NUMERIC(7,2),
+        margin_pct              NUMERIC(6,2),
         price_label             TEXT,
+        classification          TEXT,
         logged_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
     ) PARTITION BY RANGE (logged_at);
     """,
     "CREATE INDEX IF NOT EXISTS idx_cal_product ON currency_arbitrage_logs (product_id, logged_at DESC);",
+
+    # ── llm_key_usage_log ─────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS llm_key_usage_log (
+        id              BIGSERIAL PRIMARY KEY,
+        provider        TEXT NOT NULL,
+        key_identifier  TEXT NOT NULL,
+        requests_count  INTEGER NOT NULL DEFAULT 0,
+        window_start    TIMESTAMPTZ NOT NULL,
+        window_end      TIMESTAMPTZ NOT NULL,
+        rate_limited    BOOLEAN NOT NULL DEFAULT FALSE
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_provider_window ON llm_key_usage_log (provider, key_identifier, window_start DESC);",
 ]
 
 

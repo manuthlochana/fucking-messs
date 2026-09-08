@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+{% block title %}Live Overview — KALA-BALANA{% endblock %}
+
+{% block content %}
+<div class="space-y-8">
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+            <h1 class="text-2xl font-bold text-white tracking-tight">System Operational Overview</h1>
+            <p class="text-sm text-slate-400 mt-1">Real-time telemetrics across discovery crawler, durable queue, and forensic auditor.</p>
+        </div>
+        <div class="flex items-center space-x-3">
+            <a href="/ingest" class="inline-flex items-center px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm transition shadow-lg shadow-emerald-600/20">
+                <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                Ingest Target URLs
+            </a>
+        </div>
+    </div>
+
+    <!-- Active Job Banner -->
+    {% if active_job %}
+    <div class="rounded-xl p-4 bg-gradient-to-r from-emerald-950/60 via-slate-900 to-slate-900 border border-emerald-500/30 flex items-center justify-between">
+        <div class="flex items-center space-x-3">
+            <span class="relative flex h-3 w-3">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+            </span>
+            <div>
+                <span class="text-xs uppercase font-mono tracking-wider text-emerald-400 font-bold">Active Forensic Audit in Progress</span>
+                <p class="text-sm font-semibold text-white mt-0.5">{{ active_job.clean_title or active_job.listing_url }}</p>
+            </div>
+        </div>
+        <a href="/queue" class="text-xs text-emerald-400 hover:text-emerald-300 font-medium underline">View in Queue &rarr;</a>
+    </div>
+    {% else %}
+    <div class="rounded-xl p-4 bg-slate-900/60 border border-slate-800 flex items-center justify-between">
+        <div class="flex items-center space-x-3">
+            <span class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+            <span class="text-xs text-slate-400 font-mono">Forensic Worker Idle (Polling queue every 10s • Concurrency=1)</span>
+        </div>
+        <a href="/queue" class="text-xs text-slate-400 hover:text-white">View Queue &rarr;</a>
+    </div>
+    {% endif %}
+
+    <!-- KPI Grid -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        <!-- Products -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-5 relative overflow-hidden">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 font-mono">Canonical Products</span>
+                <span class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+                </span>
+            </div>
+            <p class="text-3xl font-extrabold text-white mt-3">{{ stats.products or 0 }}</p>
+            <span class="text-xs text-slate-500 mt-1 block">Deduplicated Master SKUs</span>
+        </div>
+
+        <!-- Store Listings -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-5 relative overflow-hidden">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 font-mono">Active Store Listings</span>
+                <span class="p-2 rounded-lg bg-blue-500/10 text-blue-400">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z"/></svg>
+                </span>
+            </div>
+            <p class="text-3xl font-extrabold text-white mt-3">{{ stats.listings or 0 }}</p>
+            <span class="text-xs text-slate-500 mt-1 block">Tracked retail URLs</span>
+        </div>
+
+        <!-- Pending Queue -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-5 relative overflow-hidden">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 font-mono">Forensic Queue</span>
+                <span class="p-2 rounded-lg bg-amber-500/10 text-amber-400">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                </span>
+            </div>
+            <p class="text-3xl font-extrabold text-amber-400 mt-3">{{ stats.queue_pending or 0 }}</p>
+            <span class="text-xs text-slate-500 mt-1 block">{{ stats.queue_claimed or 0 }} in-flight / {{ stats.queue_failed or 0 }} failed</span>
+        </div>
+
+        <!-- Completed Audits -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-5 relative overflow-hidden">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 font-mono">Completed Audits</span>
+                <span class="p-2 rounded-lg bg-teal-500/10 text-teal-400">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                </span>
+            </div>
+            <p class="text-3xl font-extrabold text-teal-400 mt-3">{{ stats.queue_done or 0 }}</p>
+            <span class="text-xs text-slate-500 mt-1 block">{{ stats.defects_count or 0 }} Defect dossiers generated</span>
+        </div>
+    </div>
+
+    <!-- Recent Canonical Products & Active Queue Preview -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <!-- Master Catalog Preview -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-base font-bold text-white">Recently Discovered Products</h2>
+                <a href="/catalog" class="text-xs text-emerald-400 hover:text-emerald-300">View Full Catalog &rarr;</a>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-800 text-slate-400">
+                            <th class="pb-3 font-semibold">Title</th>
+                            <th class="pb-3 font-semibold">Brand</th>
+                            <th class="pb-3 font-semibold">Status</th>
+                            <th class="pb-3 font-semibold">Lowest LKR</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/60">
+                        {% for p in recent_products %}
+                        <tr class="hover:bg-slate-800/40 transition">
+                            <td class="py-3 font-medium text-white max-w-[200px] truncate">
+                                <a href="/product/{{ p.id }}" class="hover:text-emerald-400">{{ p.clean_title }}</a>
+                            </td>
+                            <td class="py-3 text-slate-400 uppercase font-mono">{{ p.brand or '—' }}</td>
+                            <td class="py-3">
+                                <span class="px-2 py-0.5 rounded text-[10px] font-mono
+                                    {% if p.pipeline_status == 'complete' %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/30
+                                    {% elif p.pipeline_status == 'discovered' %}bg-blue-500/20 text-blue-400 border border-blue-500/30
+                                    {% elif p.pipeline_status == 'partial' %}bg-amber-500/20 text-amber-400 border border-amber-500/30
+                                    {% else %}bg-purple-500/20 text-purple-400 border border-purple-500/30{% endif %}">
+                                    {{ p.pipeline_status }}
+                                </span>
+                            </td>
+                            <td class="py-3 font-mono text-emerald-400 font-semibold">
+                                {% if p.lowest_price_lkr %}LKR {{ "{:,.0f}".format(p.lowest_price_lkr) }}{% else %}—{% endif %}
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="4" class="py-6 text-center text-slate-500">No canonical products in database yet. Run a crawl or use Ingestion Manager.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Recent Queue Activity -->
+        <div class="rounded-xl bg-slate-900 border border-slate-800 p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-base font-bold text-white">Forensic Queue Feed</h2>
+                <a href="/queue" class="text-xs text-emerald-400 hover:text-emerald-300">Manage Queue &rarr;</a>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-800 text-slate-400">
+                            <th class="pb-3 font-semibold">Job ID</th>
+                            <th class="pb-3 font-semibold">Target Product</th>
+                            <th class="pb-3 font-semibold">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/60">
+                        {% for j in recent_jobs %}
+                        <tr class="hover:bg-slate-800/40 transition">
+                            <td class="py-3 font-mono text-slate-400">#{{ j.id }}</td>
+                            <td class="py-3 font-medium text-white max-w-[220px] truncate">
+                                {{ j.clean_title or j.listing_url }}
+                            </td>
+                            <td class="py-3">
+                                <span class="px-2 py-0.5 rounded text-[10px] font-mono
+                                    {% if j.status == 'done' %}bg-emerald-500/20 text-emerald-400
+                                    {% elif j.status == 'claimed' %}bg-amber-500/20 text-amber-400 animate-pulse
+                                    {% elif j.status == 'pending' %}bg-blue-500/20 text-blue-400
+                                    {% else %}bg-rose-500/20 text-rose-400{% endif %}">
+                                    {{ j.status }}
+                                </span>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="3" class="py-6 text-center text-slate-500">Forensic queue is currently empty.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

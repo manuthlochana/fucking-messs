@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Target Ingestion Manager — KALA-BALANA{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto space-y-8">
+    <div>
+        <h1 class="text-2xl font-bold text-white tracking-tight">Target Ingestion Manager</h1>
+        <p class="text-sm text-slate-400 mt-1">Submit retail target URLs to execute bounded Crawl4AI scraping and automatically enqueue newly discovered master products to the durable forensic pipeline.</p>
+    </div>
+
+    {% if message %}
+    <div class="rounded-xl p-4 bg-emerald-950/60 border border-emerald-500/30 text-emerald-400 text-sm flex items-center space-x-3">
+        <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+        <span>{{ message }}</span>
+    </div>
+    {% endif %}
+
+    <!-- Ingestion Form -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-6">
+        <form method="POST" action="/ingest" class="space-y-6">
+            <div>
+                <label for="urls" class="block text-sm font-semibold text-white mb-2">Seed Target URLs (one per line)</label>
+                <textarea id="urls" name="urls" rows="6" required placeholder="https://example.lk/product/iphone-16-pro&#10;https://example.lk/category/laptops" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-slate-200 font-mono focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition outline-none"></textarea>
+                <p class="text-xs text-slate-500 mt-1.5">Enter product listing pages or category grids. Category URLs will be expanded up to max_depth=2.</p>
+            </div>
+
+            <!-- Quick Preset Buttons -->
+            <div>
+                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 font-mono mb-2">Sri Lankan Store Presets</label>
+                <div class="flex flex-wrap gap-2">
+                    <button type="button" onclick="setPreset('https://nanotek.lk/product/1666')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 font-mono border border-slate-700 transition">+ Nanotek Laptop</button>
+                    <button type="button" onclick="setPreset('https://lifemobile.lk/product/apple-iphone-16-pro-max-256gb/')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 font-mono border border-slate-700 transition">+ LifeMobile iPhone</button>
+                    <button type="button" onclick="setPreset('https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-emerald-400 font-mono border border-slate-700 transition">+ Sandbox Test Target</button>
+                </div>
+            </div>
+
+            <div class="pt-4 border-t border-slate-800 flex items-center justify-between">
+                <div class="text-xs text-slate-500 font-mono">
+                    Stealth crawl • Anti-bot Sentry • Concurrency=2
+                </div>
+                <button type="submit" class="px-5 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm transition shadow-lg shadow-emerald-600/20 flex items-center space-x-2">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/></svg>
+                    <span>Launch Ingestion Crawl</span>
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function setPreset(url) {
+    const ta = document.getElementById('urls');
+    if (ta.value.trim().length > 0) {
+        ta.value += '\n' + url;
+    } else {
+        ta.value = url;
+    }
+}
+</script>
+{% endblock %}

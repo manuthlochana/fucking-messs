@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+{% block title %}{{ product.clean_title }} — Forensic Dossier{% endblock %}
+
+{% block content %}
+<div class="space-y-8">
+    <!-- Breadcrumb & Title -->
+    <div>
+        <a href="/catalog" class="text-xs text-slate-400 hover:text-emerald-400">&larr; Back to Master Catalog</a>
+        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mt-2">
+            <div>
+                <h1 class="text-2xl font-black text-white tracking-tight">{{ product.clean_title }}</h1>
+                <div class="flex items-center space-x-3 mt-1 text-xs font-mono text-slate-400">
+                    <span class="text-emerald-400 font-bold uppercase">{{ product.brand or 'Unknown Brand' }}</span>
+                    <span>•</span>
+                    <span>Family: {{ product.model_family or '—' }}</span>
+                    <span>•</span>
+                    <span>ID: {{ product.id }}</span>
+                </div>
+            </div>
+            <div>
+                <span class="px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider
+                    {% if product.pipeline_status == 'complete' %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/40
+                    {% elif product.pipeline_status == 'discovered' %}bg-blue-500/20 text-blue-400 border border-blue-500/40
+                    {% elif product.pipeline_status == 'partial' %}bg-amber-500/20 text-amber-400 border border-amber-500/40
+                    {% else %}bg-purple-500/20 text-purple-400 border border-purple-500/40{% endif %}">
+                    Status: {{ product.pipeline_status }}
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 5-Phase Forensic Intelligence Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- Phase 1: Ground Truth Specs -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <span class="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono">Phase 1: Ground Truth</span>
+                <span class="text-[10px] text-slate-500 font-mono">60s Budget</span>
+            </div>
+            {% set gt = attributes.get('ground_truth', {}) %}
+            {% if gt %}
+            <div class="space-y-2.5 text-xs">
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Launch MSRP</span>
+                    <span class="font-mono font-bold text-white">${{ gt.get('launch_msrp_usd') or '—' }} USD</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Chipset / SoC</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('chipset') or '—' }}</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Display Size</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('display_inches') or '—' }}"</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Battery</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('battery_mah') or '—' }} mAh</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Main Camera</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('main_camera_mp') or '—' }} MP</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">IP Rating</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('ip_rating') or '—' }}</span>
+                </div>
+                <div class="flex justify-between py-1">
+                    <span class="text-slate-400">Chassis Material</span>
+                    <span class="font-mono text-slate-200">{{ gt.get('chassis_material') or '—' }}</span>
+                </div>
+            </div>
+            {% else %}
+            <p class="text-xs text-slate-500 py-4 text-center font-mono">Ground truth specs not yet extracted.</p>
+            {% endif %}
+        </div>
+
+        <!-- Phase 2: Arbitrage & True Landed Cost -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <span class="text-xs font-bold uppercase tracking-wider text-blue-400 font-mono">Phase 2: FX Arbitrage</span>
+                <span class="text-[10px] text-slate-500 font-mono">60s Budget</span>
+            </div>
+            {% set arb = attributes.get('arbitrage', {}) %}
+            {% if arb %}
+            <div class="space-y-2.5 text-xs">
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">CBSL / Market FX</span>
+                    <span class="font-mono text-slate-200">{{ arb.get('fx_rate_usd_lkr') or '—' }} LKR/USD</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">True Landed Cost</span>
+                    <span class="font-mono font-bold text-white">LKR {{ "{:,.0f}".format(arb.get('true_landed_cost_lkr') or 0) }}</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Asking Price</span>
+                    <span class="font-mono text-slate-200">LKR {{ "{:,.0f}".format(arb.get('merchant_price_lkr') or 0) }}</span>
+                </div>
+                <div class="flex justify-between py-1 border-b border-slate-800/40">
+                    <span class="text-slate-400">Markup Percentage</span>
+                    <span class="font-mono font-bold {% if arb.get('markup_pct', 0) > 30 %}text-rose-400{% else %}text-emerald-400{% endif %}">
+                        {{ arb.get('markup_pct') or '0' }}%
+                    </span>
+                </div>
+                <div class="flex justify-between py-1">
+                    <span class="text-slate-400">Classification</span>
+                    <span class="font-mono px-2 py-0.5 rounded text-[10px] font-bold uppercase
+                        {% if arb.get('price_label') == 'price_gouged' %}bg-rose-500/20 text-rose-400 border border-rose-500/30
+                        {% elif arb.get('price_label') == 'fair_import_margin' %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/30
+                        {% else %}bg-amber-500/20 text-amber-400 border border-amber-500/30{% endif %}">
+                        {{ arb.get('price_label') or 'unknown' }}
+                    </span>
+                </div>
+            </div>
+            {% else %}
+            <p class="text-xs text-slate-500 py-4 text-center font-mono">Arbitrage calculation pending.</p>
+            {% endif %}
+        </div>
+
+        <!-- Phase 5: Predecessor Comparison -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <span class="text-xs font-bold uppercase tracking-wider text-purple-400 font-mono">Phase 5: Generational Jump</span>
+                <span class="text-[10px] text-slate-500 font-mono">30s Budget</span>
+            </div>
+            {% set pred = attributes.get('predecessor_comparison', {}) %}
+            {% if pred %}
+            <div class="space-y-3 text-xs">
+                <div>
+                    <span class="text-slate-400 block mb-1">Upgrade Verdict:</span>
+                    <span class="px-2.5 py-1 rounded text-xs font-mono font-black uppercase
+                        {% if pred.get('verdict') == 'worth_upgrade' or pred.get('upgrade_verdict') == 'worth_upgrade' %}bg-emerald-500/20 text-emerald-400 border border-emerald-500/30
+                        {% elif pred.get('verdict') == 'skip' or pred.get('upgrade_verdict') == 'skip' %}bg-rose-500/20 text-rose-400 border border-rose-500/30
+                        {% else %}bg-amber-500/20 text-amber-400 border border-amber-500/30{% endif %}">
+                        {{ pred.get('verdict') or pred.get('upgrade_verdict') or 'marginal' }}
+                    </span>
+                </div>
+                <p class="text-slate-300 italic">{{ pred.get('reasoning') or pred.get('verdict_reasoning') or 'No reasoning logged.' }}</p>
+                {% if pred.get('key_improvements') %}
+                <div>
+                    <span class="text-emerald-400 font-semibold block mb-1">Key Upgrades:</span>
+                    <ul class="list-disc list-inside text-slate-300 space-y-0.5">
+                        {% for up in pred.get('key_improvements', []) %}
+                        <li>{{ up }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+            </div>
+            {% else %}
+            <p class="text-xs text-slate-500 py-4 text-center font-mono">Generational comparison pending.</p>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Phase 3: Defect Dossier Table -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+            <div>
+                <h2 class="text-base font-bold text-white">Phase 3: Defect & Durability Dossier</h2>
+                <p class="text-xs text-slate-400">Strict &ge;2 independent source corroboration rule applied.</p>
+            </div>
+            {% if defect_dossier %}
+            <div class="text-xs font-mono">
+                <span class="text-slate-400">Astroturf Risk:</span>
+                <span class="font-bold text-amber-400">{{ defect_dossier.astroturf_risk_score }}</span>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if defect_dossier and defect_dossier.defects %}
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+                <thead class="text-slate-400 border-b border-slate-800 uppercase font-mono">
+                    <tr>
+                        <th class="py-2.5 font-semibold">Category</th>
+                        <th class="py-2.5 font-semibold">Description</th>
+                        <th class="py-2.5 font-semibold">Severity</th>
+                        <th class="py-2.5 font-semibold">Sources</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/60">
+                    {% for d in defect_dossier.defects %}
+                    <tr class="hover:bg-slate-800/40 transition">
+                        <td class="py-3 font-mono text-emerald-400">{{ d.category or d.defect_category }}</td>
+                        <td class="py-3 text-slate-200 max-w-md">{{ d.description }}</td>
+                        <td class="py-3 font-mono">
+                            <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase
+                                {% if d.severity == 'critical' %}bg-rose-500/20 text-rose-400
+                                {% elif d.severity == 'high' %}bg-amber-500/20 text-amber-400
+                                {% else %}bg-blue-500/20 text-blue-400{% endif %}">
+                                {{ d.severity }}
+                            </span>
+                        </td>
+                        <td class="py-3 font-mono text-slate-400">{{ d.corroborating_sources|length if d.corroborating_sources else d.corroborating_count or 2 }} verified</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-xs text-slate-500 py-6 text-center font-mono">No defects confirmed by &ge;2 sources yet.</p>
+        {% endif %}
+    </div>
+
+    <!-- Store Listings & Merchant Audits (Phase 4) -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+            <div>
+                <h2 class="text-base font-bold text-white">Store Listings & Merchant Audits</h2>
+                <p class="text-xs text-slate-400">Retail asking prices, warranty tiers, and dark pattern audits.</p>
+            </div>
+            <span class="text-xs font-mono text-slate-400">{{ listings|length }} Merchant(s)</span>
+        </div>
+
+        {% if listings %}
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+                <thead class="text-slate-400 border-b border-slate-800 uppercase font-mono">
+                    <tr>
+                        <th class="py-2.5 font-semibold">Merchant Domain</th>
+                        <th class="py-2.5 font-semibold">Price (LKR)</th>
+                        <th class="py-2.5 font-semibold">Warranty Tier</th>
+                        <th class="py-2.5 font-semibold">Authorized Agent?</th>
+                        <th class="py-2.5 font-semibold">Dark Patterns Detected</th>
+                        <th class="py-2.5 font-semibold text-right">Listing</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/60">
+                    {% for l in listings %}
+                    <tr class="hover:bg-slate-800/40 transition">
+                        <td class="py-3 font-bold text-white">{{ l.merchant_name or l.merchant_domain }}</td>
+                        <td class="py-3 font-mono font-bold text-emerald-400">LKR {{ "{:,.0f}".format(l.current_price_lkr) }}</td>
+                        <td class="py-3 font-mono text-slate-300 uppercase">{{ l.warranty_tier }}</td>
+                        <td class="py-3 font-mono">
+                            {% if l.is_verified_agent %}
+                            <span class="text-emerald-400 font-bold">✓ Verified Agent</span>
+                            {% else %}
+                            <span class="text-slate-500">Unverified / Grey</span>
+                            {% endif %}
+                        </td>
+                        <td class="py-3 text-rose-400 font-mono">
+                            {% if l.dark_patterns_detected %}
+                                {{ l.dark_patterns_detected|join(", ") }}
+                            {% else %}
+                                <span class="text-slate-500">None detected</span>
+                            {% endif %}
+                        </td>
+                        <td class="py-3 text-right">
+                            <a href="{{ l.listing_url }}" target="_blank" class="text-emerald-400 hover:text-emerald-300 font-semibold underline">Visit Store &rarr;</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-xs text-slate-500 py-6 text-center font-mono">No merchant listings associated with this canonical product.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

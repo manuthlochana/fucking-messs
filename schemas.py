@@ -166,6 +166,8 @@ class GroundTruthSpec(BaseModel):
     launch_year: Optional[int] = Field(default=None, description="Year the product launched.")
     ip_rating: Optional[str] = Field(default=None, description="IP water/dust resistance rating (e.g. IP68).")
     chassis_material: Optional[str] = Field(default=None, description="Body material (e.g. 'titanium', 'aluminium', 'polycarbonate').")
+    dimensions: Optional[str] = Field(default=None, description="Physical dimensions if applicable.")
+    wattage: Optional[str] = Field(default=None, description="Power/charging wattage if applicable.")
     confidence: float = Field(description="Confidence 0-1 in the data accuracy.", default=0.5)
 
 
@@ -216,6 +218,10 @@ class DefectReport(BaseModel):
         default=0.0,
         description="0–1 score: probability that positive reviews are manufactured/astroturfed.",
     )
+    sponsored_content_ratio: float = Field(
+        default=0.0,
+        description="0–1 score: ratio of promotional/sponsored discussions detected.",
+    )
     confidence: str = Field(
         default="low",
         description="Confidence in findings: low, medium, or high.",
@@ -242,6 +248,10 @@ class MerchantAudit(BaseModel):
         default=False,
         description="True if a Sri Lankan street/city address was detected on the merchant site.",
     )
+    virtual_office_detected: bool = Field(
+        default=False,
+        description="True if listed address is in a known virtual office or mailbox service.",
+    )
     authorized_agent_verified: bool = Field(
         default=False,
         description="True if the merchant appears on the authorised distributor allowlist.",
@@ -250,6 +260,11 @@ class MerchantAudit(BaseModel):
         default=False,
         description="Alias for authorized_agent_verified for backward compatibility.",
     )
+    surcharge_map: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Map of payment method to detected surcharge percentage.",
+    )
+
 
 
 class PredecessorComparison(BaseModel):

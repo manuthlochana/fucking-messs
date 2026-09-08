@@ -240,6 +240,44 @@ def test_pro_max_not_confused_with_pro_max_in_storage(norm):
     assert spec_pro.spec_fingerprint != spec_pro_max.spec_fingerprint
 
 
+def test_charger_accessories_distinct_fingerprints(norm):
+    """Different wattage and port configs must never collide."""
+    spec_65w = norm.normalize("Baseus GaN5 Pro 65W Fast Charger 2C1A")
+    spec_100w = norm.normalize("Baseus GaN5 100W Fast Charger 2C2A")
+    assert spec_65w.spec_fingerprint != spec_100w.spec_fingerprint
+    assert "65w" in spec_65w.technical_attributes or "65w" in spec_65w.model_family
+    assert "100w" in spec_100w.technical_attributes or "100w" in spec_100w.model_family
+
+
+def test_condition_overrides_prevent_false_merges(norm):
+    """Refurbished and Used listings must never merge with brand new retail SKUs."""
+    spec_new = norm.normalize("Apple iPhone 15 128GB Sealed")
+    spec_refurb = norm.normalize("Apple iPhone 15 128GB (Refurbished)")
+    spec_used = norm.normalize("Apple iPhone 15 128GB Pre-Owned")
+
+    assert spec_new.condition == "new"
+    assert spec_refurb.condition == "refurbished"
+    assert spec_used.condition == "used"
+    assert spec_new.spec_fingerprint != spec_refurb.spec_fingerprint
+    assert spec_new.spec_fingerprint != spec_used.spec_fingerprint
+    assert spec_refurb.spec_fingerprint != spec_used.spec_fingerprint
+
+
+def test_pc_components_distinct_fingerprints(norm):
+    """RTX 4090 and RTX 4080 graphics cards must have distinct fingerprints."""
+    spec_4090 = norm.normalize("Asus ROG Strix GeForce RTX 4090 24GB VRAM GDDR6X")
+    spec_4080 = norm.normalize("Asus ROG Strix GeForce RTX 4080 16GB VRAM GDDR6X")
+    assert spec_4090.spec_fingerprint != spec_4080.spec_fingerprint
+
+
+def test_audio_anc_attributes(norm):
+    """Audio devices with ANC and codecs extract technical attributes."""
+    spec_anc = norm.normalize("Sony WF-1000XM5 Wireless Noise Cancelling Earbuds LDAC")
+    assert "anc" in spec_anc.technical_attributes
+    assert "ldac" in spec_anc.technical_attributes
+
+
+
 if __name__ == "__main__":
     import inspect
     n = SpecNormalizer()

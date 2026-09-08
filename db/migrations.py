@@ -149,37 +149,54 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_listings_product ON listings (product_id);",
     "CREATE INDEX IF NOT EXISTS idx_listings_merchant ON listings (merchant_id);",
 
-    # ── defect_dossiers ───────────────────────────────────────────────────
+    # ── defect_dossiers — one canonical dossier per product ───────────────
     """
     CREATE TABLE IF NOT EXISTS defect_dossiers (
-        id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        product_id          UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
-        source_url          TEXT,
-        source_platform     TEXT NOT NULL DEFAULT 'unknown',
-        defect_category     TEXT NOT NULL DEFAULT 'other',
-        severity            TEXT NOT NULL DEFAULT 'moderate',
-        corroborating_count INTEGER NOT NULL DEFAULT 1,
-        astroturf_score     NUMERIC(4,3) NOT NULL DEFAULT 0.0,
-        description         TEXT NOT NULL,
-        discovered_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        canonical_product_id UUID PRIMARY KEY REFERENCES canonical_products (id) ON DELETE CASCADE,
+        defects              JSONB NOT NULL DEFAULT '[]',
+        source_count         INTEGER NOT NULL DEFAULT 0,
+        confidence_label     TEXT NOT NULL DEFAULT 'low',
+        astroturf_risk_score NUMERIC(4,3) NOT NULL DEFAULT 0.0,
+        generated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
-    "CREATE INDEX IF NOT EXISTS idx_dd_product ON defect_dossiers (product_id);",
-    "CREATE INDEX IF NOT EXISTS idx_dd_severity ON defect_dossiers (severity);",
+    "CREATE INDEX IF NOT EXISTS idx_dd_confidence ON defect_dossiers (confidence_label);",
 
     # ── component_teardowns (append-only) ─────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS component_teardowns (
-        id                  BIGSERIAL PRIMARY KEY,
-        product_id          UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
-        revision_label      TEXT NOT NULL,
-        component_changed   TEXT NOT NULL,
-        change_description  TEXT NOT NULL,
-        repairability_score NUMERIC(4,2),
-        source_url          TEXT,
-        recorded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id                        BIGSERIAL PRIMARY KEY,
+        product_id                UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
+        revision_label            TEXT NOT NULL,
+        component_changed         TEXT NOT NULL,
+        change_description        TEXT NOT NULL,
+        repairability_score       NUMERIC(4,2),
+        teardown_source_url       TEXT,
+        ifixit_score              NUMERIC(4,2),
+        silent_revision_detected  BOOLEAN NOT NULL DEFAULT FALSE,
+        recorded_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
+
+    # ── forensic_queue — durable inter-process work queue ─────────────────
+    """
+    CREATE TABLE IF NOT EXISTS forensic_queue (
+        id            BIGSERIAL PRIMARY KEY,
+        product_id    UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
+        merchant_id   UUID,
+        listing_url   TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'pending',
+        error_msg     TEXT,
+        enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at    TIMESTAMPTZ,
+        completed_at  TIMESTAMPTZ,
+        CONSTRAINT forensic_queue_status_check
+            CHECK (status IN ('pending', 'claimed', 'done', 'failed'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_fq_status ON forensic_queue (status, enqueued_at);",
+    "CREATE INDEX IF NOT EXISTS idx_fq_product ON forensic_queue (product_id);",
 
     # ── price_history (monthly RANGE partitioned) ─────────────────────────
     """

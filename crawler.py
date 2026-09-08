@@ -26,7 +26,7 @@ from typing import List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from config import Settings, settings as default_settings
-from llm import GeminiClient
+from llm_pool import GeminiClient
 from logging_utils import log
 from schemas import (
     PageInspectionResult,
@@ -626,30 +626,20 @@ class AntiFragileCrawler:
                             price_lkr=item.price_lkr,
                             in_stock=item.in_stock,
                         )
-                    # Launch the 5-minute forensic pipeline as a background task.
-                    if self._llm_pool is not None and product_id:
-                        from forensic_orchestrator import ForensicContext, run_forensic_pipeline
-
-                        ctx = ForensicContext(
+                    # Enqueue to the durable forensic_queue (consumed by the
+                    # standalone --worker process) rather than spawning an
+                    # unmanaged asyncio background task inside the crawl loop.
+                    if product_id:
+                        await queries.enqueue_forensic_job(
+                            self._db_pool,
                             product_id=product_id,
-                            spec=spec,
-                            scraped_item=item,
-                            listing_url=listing_url,
                             merchant_id=merchant_id,
-                        )
-                        asyncio.create_task(
-                            run_forensic_pipeline(
-                                ctx,
-                                self._db_pool,
-                                self._llm_pool,
-                                self._settings,
-                            ),
-                            name=f"forensic_{product_id[:8]}",
+                            listing_url=listing_url,
                         )
                         log.gate(
                             "FORENSIC",
-                            f"Pipeline queued for {item.clean_title!r} "
-                            f"(id={product_id[:8]}…)",
+                            f"Job enqueued for {item.clean_title!r} "
+                            f"(id={product_id[:8]}…) — run `python main.py --worker` to process",
                         )
                 res.status = PipelineStatus.NEW_PRODUCT_QUEUED
                 res.notes.append(

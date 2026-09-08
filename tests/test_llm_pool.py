@@ -45,7 +45,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from llm import LLMError, MultiKeyLLMPool, _KeySlot
+from llm_pool import LLMError, MultiKeyLLMPool, _KeySlot
 from pydantic import BaseModel
 
 

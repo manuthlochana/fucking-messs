@@ -228,31 +228,158 @@ async def insert_arbitrage_log(
     )
 
 
-async def insert_defect_dossier(
+async def upsert_defect_dossier(
     pool: Optional[object],
     *,
     product_id: str,
-    source_url: Optional[str],
-    source_platform: str,
-    defect_category: str,
-    severity: str,
-    corroborating_count: int,
-    astroturf_score: float,
-    description: str,
+    defects: List[Dict[str, Any]],
+    source_count: int,
+    confidence_label: str,
+    astroturf_risk_score: float,
 ) -> None:
-    """Insert a defect dossier entry."""
+    """Upsert the canonical defect dossier for a product (one row per product)."""
+    if pool is None:
+        return
+    import json
+
+    await pool.execute(  # type: ignore[attr-defined]
+        """
+        INSERT INTO defect_dossiers
+            (canonical_product_id, defects, source_count, confidence_label,
+             astroturf_risk_score, generated_at, updated_at)
+        VALUES ($1::uuid, $2::jsonb, $3, $4, $5, NOW(), NOW())
+        ON CONFLICT (canonical_product_id) DO UPDATE
+            SET defects              = EXCLUDED.defects,
+                source_count         = EXCLUDED.source_count,
+                confidence_label     = EXCLUDED.confidence_label,
+                astroturf_risk_score = EXCLUDED.astroturf_risk_score,
+                updated_at           = NOW()
+        """,
+        product_id, json.dumps(defects), source_count,
+        confidence_label, astroturf_risk_score,
+    )
+
+
+async def get_defect_dossier(
+    pool: Optional[object],
+    product_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the defect dossier for a product, or None if not yet generated."""
+    if pool is None:
+        return None
+    import json
+
+    row = await pool.fetchrow(  # type: ignore[attr-defined]
+        """
+        SELECT defects, source_count, confidence_label, astroturf_risk_score, generated_at
+        FROM defect_dossiers
+        WHERE canonical_product_id = $1::uuid
+        """,
+        product_id,
+    )
+    if not row:
+        return None
+    return {
+        "defects": json.loads(row["defects"]) if isinstance(row["defects"], str) else row["defects"],
+        "source_count": row["source_count"],
+        "confidence_label": row["confidence_label"],
+        "astroturf_risk_score": float(row["astroturf_risk_score"]),
+        "generated_at": row["generated_at"].isoformat() if row["generated_at"] else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Forensic queue helpers — durable inter-process serial queue
+# ---------------------------------------------------------------------------
+
+async def enqueue_forensic_job(
+    pool: Optional[object],
+    *,
+    product_id: str,
+    merchant_id: Optional[str],
+    listing_url: str,
+) -> None:
+    """Enqueue a new forensic analysis job. No-op if pool is None."""
     if pool is None:
         return
     await pool.execute(  # type: ignore[attr-defined]
         """
-        INSERT INTO defect_dossiers
-            (product_id, source_url, source_platform, defect_category,
-             severity, corroborating_count, astroturf_score, description)
-        VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8)
+        INSERT INTO forensic_queue (product_id, merchant_id, listing_url)
+        VALUES ($1::uuid, $2::uuid, $3)
         """,
-        product_id, source_url, source_platform, defect_category,
-        severity, corroborating_count, astroturf_score, description,
+        product_id, merchant_id, listing_url,
     )
+
+
+async def claim_next_forensic_job(
+    pool: Optional[object],
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the oldest pending forensic job.
+
+    Uses ``SELECT … FOR UPDATE SKIP LOCKED`` so multiple worker processes
+    can safely compete without races. Returns None when the queue is empty.
+    """
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, product_id::text, merchant_id::text, listing_url
+                FROM forensic_queue
+                WHERE status = 'pending'
+                ORDER BY enqueued_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+            )
+            if row is None:
+                return None
+            await conn.execute(
+                """
+                UPDATE forensic_queue
+                SET status = 'claimed', claimed_at = NOW()
+                WHERE id = $1
+                """,
+                row["id"],
+            )
+    return dict(row)
+
+
+async def complete_forensic_job(
+    pool: Optional[object],
+    job_id: int,
+) -> None:
+    """Mark a claimed job as successfully completed."""
+    if pool is None:
+        return
+    await pool.execute(  # type: ignore[attr-defined]
+        """
+        UPDATE forensic_queue
+        SET status = 'done', completed_at = NOW()
+        WHERE id = $1
+        """,
+        job_id,
+    )
+
+
+async def fail_forensic_job(
+    pool: Optional[object],
+    job_id: int,
+    error_msg: str,
+) -> None:
+    """Mark a claimed job as failed with an error message."""
+    if pool is None:
+        return
+    await pool.execute(  # type: ignore[attr-defined]
+        """
+        UPDATE forensic_queue
+        SET status = 'failed', error_msg = $2, completed_at = NOW()
+        WHERE id = $1
+        """,
+        job_id, error_msg[:2000],  # cap to avoid over-long error blobs
+    )
+
 
 
 async def upsert_merchant_forensics(

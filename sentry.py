@@ -18,7 +18,7 @@ import re
 from typing import Optional, Tuple
 
 from config import Settings, settings as default_settings
-from llm import GeminiClient, LLMError
+from llm_pool import GeminiClient, LLMError
 from schemas import PageInspectionResult, PageTypeEnum
 
 # --------------------------------------------------------------------------- #

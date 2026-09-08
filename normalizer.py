@@ -236,6 +236,16 @@ class SpecNormalizer:
         region_code = self._extract_region(cleaned)
         model_family = self._extract_model_family(cleaned, brand, sub_model)
 
+        # For non-phone categories (Chargers, Audio, Components) the brand-model
+        # chain may be thin or absent. If model_family is empty or very short,
+        # fall back to technical-attribute fingerprinting so that two physically
+        # different accessories (65W vs 100W, 2C vs 1C) always produce distinct
+        # fingerprints even when sold under the same brand name.
+        if not model_family or len(model_family.strip()) < 3:
+            non_phone_attrs = self._extract_non_phone_attributes(cleaned)
+            if non_phone_attrs:
+                model_family = non_phone_attrs
+
         return NormalizedSpec.from_parts(
             brand=brand,
             model_family=model_family,
@@ -323,6 +333,66 @@ class SpecNormalizer:
         # Take the first 5 tokens as the model family to avoid bloat.
         tokens = s.split()
         return " ".join(tokens[:5])
+
+    @staticmethod
+    def _extract_non_phone_attributes(cleaned: str) -> str:
+        """Extract discriminating technical attributes for accessories/components.
+
+        Used when the standard brand→model-family chain fails (e.g. chargers,
+        earphones, cables, power banks). Mines wattage, port counts, connector
+        types, and technology keywords to produce a compact canonical string
+        like ``gan5_65w_2c1a`` that uniquely identifies the accessory SKU.
+
+        Returns an empty string when no technical attributes can be found.
+        """
+        parts: list[str] = []
+
+        # Wattage: "65W", "100 W", "45w"
+        watt_m = re.search(r"(\d{1,4})\s*[Ww]\b", cleaned)
+        if watt_m:
+            parts.append(f"{watt_m.group(1)}w")
+
+        # USB-C port count: "2C", "2-C", "2x USB-C"
+        c_port_m = re.search(r"(\d)\s*[-x]?\s*(?:usb[-\s]?c|type[-\s]?c)\b", cleaned, re.IGNORECASE)
+        if c_port_m:
+            parts.append(f"{c_port_m.group(1)}c")
+        elif re.search(r"\busb[-\s]?c\b|\btype[-\s]?c\b", cleaned, re.IGNORECASE):
+            parts.append("1c")
+
+        # USB-A port count: "1A", "1x USB-A"
+        a_port_m = re.search(r"(\d)\s*[-x]?\s*usb[-\s]?a\b", cleaned, re.IGNORECASE)
+        if a_port_m:
+            parts.append(f"{a_port_m.group(1)}a")
+        elif re.search(r"\busb[-\s]?a\b", cleaned, re.IGNORECASE):
+            parts.append("1a")
+
+        # Charging technology tags (ordered: more specific first)
+        tech_tags = [
+            (r"\bgan\s*5\b",       "gan5"),
+            (r"\bgan\s*3\b",       "gan3"),
+            (r"\bgan\b",           "gan"),
+            (r"\bpd\s*3\.1\b",     "pd31"),
+            (r"\bpd\b",            "pd"),
+            (r"\bpps\b",           "pps"),
+            (r"\bqi\s*2\b",        "qi2"),
+            (r"\bqi\b",            "qi"),
+            (r"\bmagsafe\b",       "magsafe"),
+            (r"\bnoise\s+cancell", "anc"),
+            (r"\btws\b",           "tws"),
+            (r"\bbluetooth\b",     "bt"),
+        ]
+        for pat, tag in tech_tags:
+            if re.search(pat, cleaned, re.IGNORECASE) and tag not in parts:
+                parts.insert(0, tag)   # prepend tech tag for readability
+                break
+
+        # Capacity for power banks: "20000mAh", "20000 mah"
+        mah_m = re.search(r"(\d{4,6})\s*m[Aa][Hh]\b", cleaned)
+        if mah_m:
+            parts.append(f"{mah_m.group(1)}mah")
+
+        return "_".join(parts) if parts else ""
+
 
 
 # ---------------------------------------------------------------------------

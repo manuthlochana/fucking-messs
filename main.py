@@ -153,6 +153,130 @@ async def _print_db_summary(pool: object) -> None:
         log.warn(f"Could not fetch DB summary: {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# Mode: --delta-poll
+# ---------------------------------------------------------------------------
+async def cmd_delta_poll(use_db: bool) -> None:
+    """Nightly fast-delta poller for price/stock updates."""
+    log.header("KALA-BALANA — DELTA POLL MODE")
+    if not use_db:
+        log.error("Delta poll requires database (--db). Exiting.")
+        return
+        
+    db_pool = await _init_db()
+    if not db_pool:
+        return
+        
+    try:
+        from db import queries
+        import httpx
+        import re
+        from schemas import ProductExtraction
+        llm, llm_pool = _build_llm_clients()
+        from sentry import SmartSentry
+        sentry = SmartSentry(llm, settings)
+
+        log.info("Fetching existing active listings for nightly delta polling...")
+        rows = await db_pool.fetch(
+            "SELECT id, product_id, listing_url, current_price_lkr, in_stock FROM listings"
+        )
+        log.info(f"Found {len(rows)} listings to poll.")
+        
+        headers = {
+            "User-Agent": settings.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        updated_count = 0
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+            for row in rows:
+                url = row["listing_url"]
+                lid = row["id"]
+                current_price = float(row["current_price_lkr"] or 0.0)
+                old_stock = bool(row["in_stock"])
+                
+                try:
+                    resp = await client.get(url)
+                    new_stock = old_stock
+                    new_price = None
+
+                    if resp.status_code == 404:
+                        new_stock = False
+                    elif resp.status_code == 200:
+                        html = resp.text
+
+                        # 1. Stock status check
+                        oos_match = re.search(r"\b(out of stock|sold out|unavailable|discontinued|no stock)\b", html, re.I)
+                        in_stock_match = re.search(r"\b(in stock|add to cart|buy now|available)\b", html, re.I)
+                        if oos_match and not in_stock_match:
+                            new_stock = False
+                        elif in_stock_match:
+                            new_stock = True
+
+                        # 2. Price extraction: regex anchors (JSON-LD, microdata, currency prefixes)
+                        # JSON-LD offer price
+                        json_ld_m = re.search(r'"price"\s*:\s*["\']?([\d,]+(?:\.\d{2})?)["\']?', html, re.I)
+                        if json_ld_m:
+                            try:
+                                p_val = float(json_ld_m.group(1).replace(",", ""))
+                                if p_val > 0:
+                                    new_price = p_val
+                            except ValueError:
+                                pass
+
+                        # DOM price tag (Rs. / LKR)
+                        if new_price is None:
+                            lkr_m = re.search(r'(?:Rs\.?|LKR)\s*([\d,]{3,}(?:\.\d{2})?)', html, re.I)
+                            if lkr_m:
+                                try:
+                                    p_val = float(lkr_m.group(1).replace(",", ""))
+                                    if p_val > 0:
+                                        new_price = p_val
+                                except ValueError:
+                                    pass
+
+                        # If regex is ambiguous and LLM is available, use Sentry / structured extraction on truncated HTML
+                        if new_price is None and llm is not None:
+                            try:
+                                snippet = html[:4000]
+                                ext = await sentry.extract_product_item(url, snippet)
+                                if ext and ext.price_lkr > 0:
+                                    new_price = ext.price_lkr
+                                    new_stock = ext.in_stock
+                            except Exception:
+                                pass
+
+                    # 3. Determine if price or stock changed
+                    price_changed = (new_price is not None) and (abs(new_price - current_price) > 0.01)
+                    stock_changed = (new_stock != old_stock)
+
+                    if price_changed or stock_changed:
+                        effective_price = new_price if new_price is not None else current_price
+                        await db_pool.execute(
+                            """
+                            UPDATE listings
+                            SET current_price_lkr = $2, in_stock = $3, updated_at = NOW()
+                            WHERE id = $1::uuid
+                            """,
+                            lid, effective_price, new_stock
+                        )
+                        await queries.log_price_history(
+                            db_pool,
+                            listing_id=str(lid),
+                            price_lkr=effective_price,
+                            in_stock=new_stock,
+                        )
+                        updated_count += 1
+                        log.info(f"[Delta Poll] {url} -> LKR {current_price} => {effective_price} | in_stock: {old_stock} => {new_stock}")
+
+                except Exception as exc:
+                    log.warn(f"[Delta Poll] Failed to poll {url}: {exc}")
+                    
+        log.success(f"Delta polling complete: {updated_count}/{len(rows)} listings updated.")
+    finally:
+        await _close_db(db_pool)
+
 # ---------------------------------------------------------------------------
 # Mode: --crawl
 # ---------------------------------------------------------------------------
@@ -397,6 +521,12 @@ def main() -> None:
             asyncio.run(cmd_demo(use_db=use_db))
         except KeyboardInterrupt:
             log.warn("Demo interrupted by user.")
+            
+    elif mode == "--delta-poll":
+        try:
+            asyncio.run(cmd_delta_poll(use_db=use_db))
+        except KeyboardInterrupt:
+            log.warn("Delta poll interrupted by user.")
 
     elif mode == "--dashboard":
         port = 8000

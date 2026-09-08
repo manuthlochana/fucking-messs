@@ -22,6 +22,22 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+
+import json
+import asyncio
+from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
+
+class UniversalTechSpec(BaseModel):
+    brand: Optional[str] = Field(default=None)
+    model_family: Optional[str] = Field(default=None)
+    sub_model: Optional[str] = Field(default=None)
+    ram_gb: Optional[int] = Field(default=None)
+    storage_gb: Optional[int] = Field(default=None)
+    region_code: Optional[str] = Field(default="")
+    condition: Optional[str] = Field(default="new")
+    technical_attributes: Dict[str, Any] = Field(default_factory=dict)
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -229,8 +245,104 @@ class NormalizedSpec:
 # Core normalizer class
 # ---------------------------------------------------------------------------
 
+
+_NON_PHONE_CATEGORY_KEYWORDS = [
+    r"\bmonitor\b",
+    r"\bdisplay\b",
+    r"\bkeyboard\b",
+    r"\bssd\b",
+    r"\bnvme\b",
+    r"\bdrone\b",
+    r"\bheadphone\b",
+    r"\bheadphones\b",
+    r"\bearbuds\b",
+    r"\bearbud\b",
+    r"\btws\b",
+    r"\bcharger\b",
+    r"\bpowerbank\b",
+    r"\bpower\s+bank\b",
+    r"\bmouse\b",
+    r"\bgpu\b",
+    r"\bgraphics\s+card\b",
+]
+_NON_PHONE_CATEGORY_RE = re.compile(
+    "|".join(_NON_PHONE_CATEGORY_KEYWORDS), re.IGNORECASE
+)
+
+
+class UniversalTechSpecExtractor:
+    """Tier 2 Normalizer using Gemini Flash."""
+    
+    _PROMPT = """
+    Extract hardware specifications from the following product title:
+    '{title}'
+    
+    You are extracting details for non-phone categories (Monitors, Storage, Keyboards, Drones, Audio, PC Components).
+    Identify the brand, model_family, sub_model, ram_gb, storage_gb, and any relevant technical attributes (wattage, layout, switch type, capacity, resolution, refresh rate).
+    Return a structured JSON according to the schema. If an attribute is missing, omit it or return null.
+    """
+
+    async def extract(self, raw_title: str, llm_pool: Any) -> UniversalTechSpec:
+        prompt = self._PROMPT.format(title=raw_title)
+        try:
+            return await llm_pool.generate_structured(prompt, UniversalTechSpec)
+        except Exception:
+            # Fallback to empty spec if LLM fails
+            return UniversalTechSpec(technical_attributes={"raw": raw_title})
+
 class SpecNormalizer:
     """Strips noise and deterministically extracts product spec fields."""
+
+
+    async def normalize_async(
+        self,
+        raw_title: str,
+        llm_pool: Optional[Any] = None,
+        brand_hint: Optional[str] = None,
+    ) -> NormalizedSpec:
+        """Asynchronous entry point that falls back to Tier 2 extraction if Tier 1 confidence is low or non-phone category detected."""
+        # Tier 1 extraction
+        t1_spec = self.normalize(raw_title, brand_hint)
+        
+        # Rule: Explicitly check for non-phone keywords (monitor, display, keyboard, ssd, nvme, drone, headphone, etc.)
+        # If ANY of these category keywords are detected, or if no phone model matches, FORCIBLY trigger Tier 2 UniversalTechSpecExtractor
+        has_non_phone_keyword = bool(_NON_PHONE_CATEGORY_RE.search(raw_title))
+        has_phone_model = bool(t1_spec.model_family and len(t1_spec.model_family) >= 3 and not has_non_phone_keyword)
+        
+        needs_tier_2 = has_non_phone_keyword or (not has_phone_model) or bool(t1_spec.technical_attributes)
+        
+        if not needs_tier_2 or not llm_pool:
+            return t1_spec
+            
+        # Tier 2 Extraction
+        extractor = UniversalTechSpecExtractor()
+        t2_res = await extractor.extract(raw_title, llm_pool)
+        
+        # Merge results, prioritizing Tier 2 technical attributes
+        tech_attrs = json.dumps(t2_res.technical_attributes, sort_keys=True) if t2_res.technical_attributes else ""
+        
+        fp = _compute_universal_fingerprint(
+            brand=t2_res.brand or t1_spec.brand,
+            model_family=t2_res.model_family or t1_spec.model_family,
+            sub_model=t2_res.sub_model or t1_spec.sub_model,
+            ram_gb=t2_res.ram_gb or t1_spec.ram_gb,
+            storage_gb=t2_res.storage_gb or t1_spec.storage_gb,
+            region_code=t2_res.region_code or t1_spec.region_code,
+            condition=t2_res.condition or t1_spec.condition,
+            technical_attributes=t2_res.technical_attributes
+        )
+        
+        return NormalizedSpec(
+            brand=(t2_res.brand or t1_spec.brand).lower().strip(),
+            model_family=(t2_res.model_family or t1_spec.model_family).lower().strip(),
+            sub_model=(t2_res.sub_model or t1_spec.sub_model).lower().strip(),
+            ram_gb=t2_res.ram_gb or t1_spec.ram_gb,
+            storage_gb=t2_res.storage_gb or t1_spec.storage_gb,
+            region_code=(t2_res.region_code or t1_spec.region_code).lower().strip(),
+            spec_fingerprint=fp,
+            condition=(t2_res.condition or t1_spec.condition).lower().strip(),
+            technical_attributes=tech_attrs
+        )
 
     def normalize(
         self,
@@ -447,6 +559,32 @@ class SpecNormalizer:
 # ---------------------------------------------------------------------------
 # Fingerprint computation
 # ---------------------------------------------------------------------------
+
+
+def _compute_universal_fingerprint(
+    brand: str,
+    model_family: str,
+    sub_model: str,
+    ram_gb: Optional[int],
+    storage_gb: Optional[int],
+    region_code: str,
+    condition: str,
+    technical_attributes: Dict[str, Any],
+) -> str:
+    # Rule 39: Alphabetically sort structural JSON key-values
+    tech_str = json.dumps(technical_attributes, sort_keys=True) if technical_attributes else ""
+    canonical = (
+        f"{brand.lower().strip()}"
+        f"|{model_family.lower().strip()}"
+        f"|{sub_model.lower().strip()}"
+        f"|{ram_gb if ram_gb is not None else ''}"
+        f"|{storage_gb if storage_gb is not None else ''}"
+        f"|{region_code.lower().strip()}"
+    )
+    if condition != "new" or tech_str:
+        canonical += f"|{condition.lower().strip()}|{tech_str}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 def _compute_fingerprint(
     brand: str,

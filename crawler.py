@@ -234,21 +234,47 @@ class AntiFragileCrawler:
             kwargs["proxy"] = self._settings.proxy
         if self._settings.user_agent:
             kwargs["user_agent"] = self._settings.user_agent
-        return BrowserConfig(**kwargs)
+        if BrowserConfig is not None:
+            return BrowserConfig(**kwargs)
+        from types import SimpleNamespace
+        return SimpleNamespace(**kwargs)
 
     def _run_config(self, stealth: bool):
+        cache_mode = getattr(CacheMode, "BYPASS", None) if CacheMode is not None else None
         kwargs = dict(
-            cache_mode=CacheMode.BYPASS,
+            cache_mode=cache_mode,
             exclude_external_images=True,
             screenshot=False,
             remove_overlay_elements=True,
             word_count_threshold=1,
             verbose=False,
         )
+        # Honeypot Rejection: Purge hidden/zero-dimension/off-viewport trap elements directly from DOM
+        honeypot_js = """
+        document.querySelectorAll('a, input, button, select, textarea, form, [href]').forEach(el => {
+            try {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                if (
+                    style.display === 'none' ||
+                    style.opacity === '0' ||
+                    style.visibility === 'hidden' ||
+                    rect.width === 0 ||
+                    rect.height === 0 ||
+                    rect.top < -500 ||
+                    rect.left < -500
+                ) {
+                    el.remove();
+                }
+            } catch (e) {}
+        });
+        """
+        kwargs["js_code"] = honeypot_js
+
         if stealth:
             kwargs.update(
                 magic=True,               # bundle of anti-bot evasions
-                simulate_user=True,
+                simulate_user=True,       # Crawl4AI applies randomized bezier mouse movements
                 override_navigator=True,
                 wait_until="networkidle",  # let a challenge settle/resolve
                 page_timeout=self._settings.stealth_page_timeout_ms,
@@ -259,7 +285,10 @@ class AntiFragileCrawler:
                 wait_until="domcontentloaded",
                 page_timeout=self._settings.page_timeout_ms,
             )
-        return CrawlerRunConfig(**kwargs)
+        if CrawlerRunConfig is not None:
+            return CrawlerRunConfig(**kwargs)
+        from types import SimpleNamespace
+        return SimpleNamespace(**kwargs)
 
     # ------------------------------------------------------------------ #
     # Resource-blocking hook (belt & suspenders with text_mode)

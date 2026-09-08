@@ -152,8 +152,26 @@ async def _phase1_ground_truth(
         system_instruction=system,
         temperature=0.0,
         max_output_tokens=512,
+        db_pool=db_pool,
     )
-    return result.model_dump()
+    dumped = result.model_dump()
+    
+    # Generate and store embedding (Live Supabase Vector Embeddings)
+    try:
+        text_to_embed = f"Product: {product_name} Specs: {json.dumps(dumped)}"
+        embeddings = await llm_pool.generate_embeddings([text_to_embed], db_pool=db_pool)
+        if embeddings and db_pool:
+            vector = embeddings[0]
+            # Use pgvector formatting
+            await db_pool.execute(
+                "INSERT INTO product_embeddings (product_id, embedding) VALUES ($1, $2) ON CONFLICT (product_id) DO UPDATE SET embedding = EXCLUDED.embedding",
+                ctx.product_id, str(vector)
+            )
+    except Exception as exc:
+        from logging_utils import log
+        log.warn(f"[Forensic P1] Embedding generation/insertion failed: {exc}")
+        
+    return dumped
 
 
 async def _phase2_fx_arbitrage(
@@ -351,8 +369,23 @@ async def _phase3_defect_mining(
                 astroturf_risk_score=astroturf_risk,
                 sponsored_content_ratio=sponsored_ratio,
             )
+
+            # Persist real component revisions / teardown findings if detected
+            for d in report_schema.defects:
+                if d.resolved_in_revision or "revision" in d.category.lower() or "teardown" in d.description.lower():
+                    src_url = d.corroborating_sources[0] if d.corroborating_sources else None
+                    await queries.insert_component_teardown(
+                        db_pool,
+                        product_id=ctx.product_id,
+                        component_name=d.category,
+                        observed_revision=d.resolved_in_revision or "rev_flagged",
+                        teardown_source_url=src_url,
+                        source_url=src_url,
+                        silent_revision_detected=bool(d.resolved_in_revision),
+                        notes=d.description,
+                    )
         except Exception as exc:
-            log.warn(f"[Forensic P3] DB defect write failed: {exc}")
+            log.warn(f"[Forensic P3] DB defect/teardown write failed: {exc}")
 
     return defects
 

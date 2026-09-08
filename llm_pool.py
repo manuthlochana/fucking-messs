@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Optional, Type, TypeVar
 
 from pydantic import BaseModel
@@ -271,6 +272,7 @@ class MultiKeyLLMPool:
         max_output_tokens: Optional[int] = None,
         disable_thinking: Optional[bool] = None,
         model: Optional[str] = None,
+        db_pool: Optional[object] = None,
     ) -> "T":  # noqa: F821
         """Call the best available LLM slot and return a validated Pydantic object."""
         last_err: Optional[Exception] = None
@@ -279,6 +281,20 @@ class MultiKeyLLMPool:
             if not slot.is_available():
                 continue
             slot.record_call()
+            
+            # Log usage
+            if db_pool is not None:
+                from db.queries import log_llm_key_usage
+                now = datetime.now(timezone.utc)
+                asyncio.create_task(log_llm_key_usage(
+                    db_pool,
+                    provider=slot.provider,
+                    key_identifier=slot.api_key[-6:],
+                    window_start=now,
+                    window_end=now,
+                    rate_limited=False
+                ))
+                
             try:
                 if slot.provider == "gemini":
                     return await self._call_gemini(
@@ -380,6 +396,7 @@ class MultiKeyLLMPool:
         *, system_instruction, temperature, max_output_tokens
     ):
         import json
+        from datetime import datetime, timezone
         from config import settings as _settings
         client = self._groq_client(slot.api_key)
 
@@ -405,3 +422,54 @@ class MultiKeyLLMPool:
             return schema.model_validate_json(content)
         except Exception:
             return schema.model_validate(json.loads(content))
+
+    async def generate_embeddings(
+        self,
+        texts: list[str],
+        model: str = "text-embedding-004",
+        db_pool: Optional[object] = None,
+    ) -> list[list[float]]:
+        """Generate embeddings using the Gemini provider slots."""
+        last_err = None
+        for slot in self._slots:
+            if slot.provider != "gemini" or not slot.is_available():
+                continue
+            slot.record_call()
+            
+            if db_pool is not None:
+                from db.queries import log_llm_key_usage
+                now = datetime.now(timezone.utc)
+                asyncio.create_task(log_llm_key_usage(
+                    db_pool,
+                    provider=slot.provider,
+                    key_identifier=slot.api_key[-6:],
+                    window_start=now,
+                    window_end=now,
+                    rate_limited=False
+                ))
+
+            try:
+                client, types = self._gemini_client(slot.api_key)
+                
+                # google-genai 2.10 SDK embedding format
+                # client.aio.models.embed_content(model="text-embedding-004", contents=texts)
+                resp = await client.aio.models.embed_content(
+                    model=model,
+                    contents=texts
+                )
+                
+                # resp.embeddings is a list of objects with a .values attribute
+                if isinstance(resp.embeddings, list):
+                    return [emb.values for emb in resp.embeddings]
+                else:
+                    return [resp.embeddings.values]
+            except Exception as exc:
+                last_err = exc
+                msg = str(exc).lower()
+                if "429" in msg or "rate" in msg or "quota" in msg or "exhausted" in msg:
+                    slot.mark_rate_limited()
+                else:
+                    slot.mark_error()
+                continue
+                
+        raise LLMError(f"All Gemini slots exhausted or failed for embeddings. Last err: {last_err}")

@@ -26,9 +26,11 @@ from logging_utils import log
 # ---------------------------------------------------------------------------
 
 _DDL_STATEMENTS = [
-    # ── pgvector extension ──────────────────────────────────────────────────
+    # ── extensions ─────────────────────────────────────────────────────────
     "CREATE EXTENSION IF NOT EXISTS vector;",
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
     "CREATE EXTENSION IF NOT EXISTS pgcrypto;",  # for gen_random_uuid()
+    "CREATE EXTENSION IF NOT EXISTS btree_gist;",
 
     # ── pipeline_status enum ────────────────────────────────────────────────
     """
@@ -90,7 +92,7 @@ _DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS product_embeddings (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        product_id  UUID NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
+        product_id  UUID UNIQUE NOT NULL REFERENCES canonical_products (id) ON DELETE CASCADE,
         embedding   vector(768),
         model_name  TEXT NOT NULL DEFAULT 'text-embedding-004',
         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -98,7 +100,7 @@ _DDL_STATEMENTS = [
     """,
     # HNSW index for fast approximate nearest-neighbour search.
     """
-    CREATE INDEX IF NOT EXISTS idx_pe_embedding_hnsw
+    CREATE INDEX IF NOT EXISTS idx_product_embedding_hnsw
         ON product_embeddings
         USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64);
@@ -206,6 +208,7 @@ _DDL_STATEMENTS = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_teardowns_product ON component_teardowns (product_id);",
+    "CREATE INDEX IF NOT EXISTS idx_ct_date_range ON component_teardowns USING gist (manufacture_date_range);",
 
     # ── forensic_queue — durable inter-process work queue ─────────────────
     """

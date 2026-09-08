@@ -18,7 +18,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-pytest_plugins = ["anyio"]
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 DB_DSN = os.getenv("DB_DSN", "")
 pytestmark = pytest.mark.skipif(
@@ -180,5 +184,5 @@ async def test_pipeline_status_update(pool):
     )
     import json
     assert row["pipeline_status"] == "phase1_done"
-    attrs = json.loads(row["attributes"])
+    attrs = json.loads(row["attributes"]) if isinstance(row["attributes"], str) else row["attributes"]
     assert attrs.get("test_key") == "test_val"

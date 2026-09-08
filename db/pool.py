@@ -76,14 +76,15 @@ async def close_pool(pool: Optional["asyncpg.Pool"]) -> None:
 async def _register_codecs(conn: "asyncpg.Connection") -> None:
     """Register pgvector codecs on each new connection.
 
-    pgvector exposes its type as a custom OID. We register a simple
-    text codec so asyncpg can send/receive float lists as the wire
-    format ``'[0.1,0.2,...]'`` expected by the vector type.
+    Uses pgvector.asyncpg if available, otherwise registers a custom text codec.
     """
     try:
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        from pgvector.asyncpg import register_vector
+        await register_vector(conn)
+        return
     except Exception:
-        pass  # May lack superuser; extension should already exist.
+        pass
+
     try:
         # asyncpg needs to know the OID of the 'vector' type.
         row = await conn.fetchrow(

@@ -387,6 +387,11 @@ class SpecNormalizer:
         if watt_m:
             parts.append(f"{watt_m.group(1)}w")
 
+        # Voltage: "110V", "120V", "220V", "230V", "240V" (prevents false merges between 110V and 230V SKUs)
+        volt_m = re.search(r"\b(110\s*v|120\s*v|220\s*v|230\s*v|240\s*v)\b", cleaned, re.IGNORECASE)
+        if volt_m:
+            parts.append(re.sub(r"\s+", "", volt_m.group(1).lower()))
+
         # Port configuration: 2C1A, 3C1A, 2C, 1C
         port_combo_m = re.search(r"\b(\d[Cc]\d[Aa]|\d[Cc]|\d[Aa])\b", cleaned)
         if port_combo_m:

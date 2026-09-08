@@ -277,6 +277,15 @@ def test_audio_anc_attributes(norm):
     assert "ldac" in spec_anc.technical_attributes
 
 
+def test_voltage_sku_distinct_fingerprints(norm):
+    """110V US appliances and 230V local/UK appliances must never collide."""
+    spec_110v = norm.normalize("Dyson Airwrap Multi-Styler Complete 110V US Model")
+    spec_230v = norm.normalize("Dyson Airwrap Multi-Styler Complete 230V UK Model")
+    assert spec_110v.spec_fingerprint != spec_230v.spec_fingerprint
+    assert "110v" in spec_110v.technical_attributes
+    assert "230v" in spec_230v.technical_attributes
+
+
 
 if __name__ == "__main__":
     import inspect

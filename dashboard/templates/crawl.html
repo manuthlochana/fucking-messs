@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Crawl Monitor{% endblock %}
+{% block content %}
+<div class="space-y-8">
+    <div class="flex items-center justify-between">
+        <div>
+            <h1 class="text-2xl font-extrabold text-white tracking-tight">Autonomous Crawl Monitor</h1>
+            <p class="text-slate-400 text-sm mt-1">Domain-wide discovery &amp; polite drip-crawl progress.</p>
+        </div>
+    </div>
+
+    <!-- Add a new domain -->
+    <form action="/api/domains/add" method="post"
+          class="bg-slate-900/60 border border-slate-800 rounded-xl p-5 flex flex-col sm:flex-row gap-3 sm:items-end">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="flex-1">
+            <label class="block text-xs uppercase tracking-widest text-slate-400 font-mono mb-1">Domain URL</label>
+            <input name="domain" type="text" required placeholder="https://tudo.lk"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+        </div>
+        <div class="w-full sm:w-40">
+            <label class="block text-xs uppercase tracking-widest text-slate-400 font-mono mb-1">Daily Page Limit</label>
+            <input name="daily_page_limit" type="number" value="1500" min="1"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+        </div>
+        <button type="submit"
+                class="bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold rounded-lg px-5 py-2 text-sm shadow-lg shadow-emerald-500/20">
+            Discover Catalog
+        </button>
+    </form>
+
+    {% if message %}
+    <div class="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-sm rounded-lg px-4 py-3">
+        {{ message }}
+    </div>
+    {% endif %}
+
+    <!-- Per-domain rollup -->
+    <div class="bg-slate-900/60 border border-slate-800 rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+            <thead class="bg-slate-800/60 text-slate-400 text-xs uppercase tracking-widest font-mono">
+                <tr>
+                    <th class="text-left px-4 py-3">Domain</th>
+                    <th class="text-right px-4 py-3">Discovered</th>
+                    <th class="text-right px-4 py-3">Pending</th>
+                    <th class="text-right px-4 py-3">Scraped Today</th>
+                    <th class="text-right px-4 py-3">Failed</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800">
+                {% for d in domains %}
+                <tr class="hover:bg-slate-800/40">
+                    <td class="px-4 py-3 font-medium text-white">{{ d.domain }}</td>
+                    <td class="px-4 py-3 text-right text-slate-300">{{ d.total }}</td>
+                    <td class="px-4 py-3 text-right text-amber-400">{{ d.pending }}</td>
+                    <td class="px-4 py-3 text-right text-emerald-400">{{ d.scraped_today }}</td>
+                    <td class="px-4 py-3 text-right text-rose-400">{{ d.failed }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500">No domains ingested yet. Add one above.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

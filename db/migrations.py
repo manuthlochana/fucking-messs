@@ -280,6 +280,42 @@ _DDL_STATEMENTS = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_llm_usage_provider_window ON llm_key_usage_log (provider, key_identifier, window_start DESC);",
+
+    # ── crawl_queue — autonomous domain-wide URL discovery/scrape queue ───
+    """
+    CREATE TABLE IF NOT EXISTS crawl_queue (
+        id            BIGSERIAL PRIMARY KEY,
+        domain        TEXT NOT NULL,
+        url           TEXT UNIQUE NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'pending',
+        depth         INTEGER NOT NULL DEFAULT 0,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        error_msg     TEXT,
+        discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at    TIMESTAMPTZ,
+        completed_at  TIMESTAMPTZ,
+        CONSTRAINT crawl_queue_status_check
+            CHECK (status IN ('pending', 'in_progress', 'completed', 'failed'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cq_domain_status ON crawl_queue (domain, status, discovered_at);",
+    "CREATE INDEX IF NOT EXISTS idx_cq_status ON crawl_queue (status, discovered_at);",
+
+    # ── domain_profiles — cached zero-selector extraction hints per domain ─
+    """
+    CREATE TABLE IF NOT EXISTS domain_profiles (
+        domain               TEXT PRIMARY KEY,
+        title_selector       TEXT,
+        price_selector       TEXT,
+        stock_selector       TEXT,
+        specs_table_selector TEXT,
+        extraction_tier      TEXT,
+        success_count        INTEGER NOT NULL DEFAULT 0,
+        failure_count        INTEGER NOT NULL DEFAULT 0,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
 ]
 
 
@@ -310,6 +346,45 @@ async def run_migrations(pool: Optional[object]) -> None:
 
     await _ensure_current_partitions(pool)
     log.success("DB migrations complete.")
+
+
+async def ensure_monthly_partitions(pool: Optional[object], months_ahead: int = 3) -> None:
+    """Create monthly RANGE child partitions for the current + upcoming months.
+
+    Public startup/cron hook. Creates ``price_history_YYYY_MM`` and
+    ``currency_arbitrage_logs_YYYY_MM`` partitions for the current month and the
+    next ``months_ahead`` months so inserts never hit a missing-partition error.
+    No-op in dry-run mode (``pool is None``); never raises.
+    """
+    if pool is None:
+        log.debug("Partition maintenance skipped (dry-run mode).")
+        return
+
+    today = date.today()
+    # First-of-month anchors for current month plus `months_ahead` future months,
+    # plus one extra to serve as the exclusive upper bound of the last window.
+    months: list[date] = []
+    d = today.replace(day=1)
+    for _ in range(max(1, months_ahead) + 2):
+        months.append(d)
+        d = d.replace(year=d.year + 1, month=1) if d.month == 12 else d.replace(month=d.month + 1)
+
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        for i in range(len(months) - 1):
+            start, end = months[i], months[i + 1]
+            label = start.strftime("%Y_%m")
+            for table in ("price_history", "currency_arbitrage_logs"):
+                part_name = f"{table}_{label}"
+                ddl = (
+                    f"CREATE TABLE IF NOT EXISTS {part_name} "
+                    f"PARTITION OF {table} "
+                    f"FOR VALUES FROM ('{start}') TO ('{end}');"
+                )
+                try:
+                    await conn.execute(ddl)
+                    log.debug(f"Partition ensured: {part_name}")
+                except Exception as exc:
+                    log.debug(f"Partition {part_name} note: {exc!r}")
 
 
 async def _ensure_current_partitions(pool: object) -> None:

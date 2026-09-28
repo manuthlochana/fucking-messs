@@ -240,6 +240,38 @@ CREATE TABLE IF NOT EXISTS llm_key_usage_log (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_provider_window ON llm_key_usage_log (provider, key_identifier, window_start DESC);
 
+-- ── crawl_queue — autonomous domain-wide URL discovery/scrape queue ───────────
+CREATE TABLE IF NOT EXISTS crawl_queue (
+    id            BIGSERIAL PRIMARY KEY,
+    domain        TEXT NOT NULL,
+    url           TEXT UNIQUE NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    depth         INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    error_msg     TEXT,
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ,
+    CONSTRAINT crawl_queue_status_check
+        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_cq_domain_status ON crawl_queue (domain, status, discovered_at);
+CREATE INDEX IF NOT EXISTS idx_cq_status ON crawl_queue (status, discovered_at);
+
+-- ── domain_profiles — cached zero-selector extraction hints per domain ────────
+CREATE TABLE IF NOT EXISTS domain_profiles (
+    domain               TEXT PRIMARY KEY,
+    title_selector       TEXT,
+    price_selector       TEXT,
+    stock_selector       TEXT,
+    specs_table_selector TEXT,
+    extraction_tier      TEXT,
+    success_count        INTEGER NOT NULL DEFAULT 0,
+    failure_count        INTEGER NOT NULL DEFAULT 0,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ============================================================================
 -- Monthly partition maintenance
 -- ============================================================================

@@ -62,6 +62,9 @@ def check_imports() -> None:
         "forensic_worker",
         "forensics",
         "advisor",
+        "discovery",
+        "auto_extractor",
+        "search_client",
         "site_profiles.loader",
     ]
     for name in core:
@@ -90,6 +93,8 @@ def check_schema() -> None:
         "forensic_queue",
         "price_history",
         "currency_arbitrage_logs",
+        "crawl_queue",
+        "domain_profiles",
     ]
     missing = [t for t in expected if f"table if not exists {t}" not in sql]
     _record("schema tables declared", not missing,

@@ -648,6 +648,73 @@ async def cmd_worker(use_db: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mode: --ingest-domain  (Step 1 — autonomous site discovery)
+# ---------------------------------------------------------------------------
+
+async def cmd_ingest_domain(domain_url: str, use_db: bool, daily_page_limit: int = 1500) -> None:
+    """Discover a domain's catalog (robots→sitemap→spider) and enqueue URLs.
+
+    Operator supplies only the domain root; ``discovery.ingest_domain`` inspects
+    robots.txt, parses sitemap(s), falls back to BFS spidering, and seeds the
+    durable ``crawl_queue`` for the polite drip worker to drain over days.
+    """
+    import discovery
+
+    db_pool = await _init_db() if use_db else None
+    if use_db and db_pool is None:
+        log.error("--ingest-domain --db requested but DB connection failed.")
+        return
+    try:
+        summary = await discovery.ingest_domain(
+            domain_url, db_pool, daily_page_limit=daily_page_limit, settings=settings
+        )
+        log.success(
+            f"[Ingest] {summary.get('domain')}: method={summary.get('method')} "
+            f"discovered={summary.get('discovered')} enqueued={summary.get('enqueued')} "
+            f"(sitemaps={len(summary.get('sitemaps') or [])})"
+        )
+        if not use_db:
+            log.warn("Dry-run (no --db): URLs discovered but not persisted to crawl_queue.")
+    finally:
+        await _close_db(db_pool)
+
+
+# ---------------------------------------------------------------------------
+# Mode: --drip  (Step 1 — polite drip crawler draining crawl_queue)
+# ---------------------------------------------------------------------------
+
+async def cmd_drip(use_db: bool, domain: Optional[str] = None,
+                   daily_page_limit: int = 1500) -> None:
+    """Drain the crawl_queue politely, extracting + persisting each product page."""
+    import discovery
+
+    if not use_db:
+        log.error("--drip requires --db (crawl_queue lives in PostgreSQL).")
+        return
+
+    db_pool = await _init_db()
+    if db_pool is None:
+        log.error("Cannot start drip worker: DB connection failed.")
+        return
+
+    _, llm_pool = _build_llm_clients()  # LLM optional (Tier 3 selector inference)
+
+    try:
+        stats = await discovery.run_drip_worker(
+            db_pool, domain=domain, settings=settings, llm_pool=llm_pool,
+            daily_page_limit=daily_page_limit,
+        )
+        log.success(
+            f"[Drip] done — scraped={stats.get('scraped')} "
+            f"failed={stats.get('failed')} skipped={stats.get('skipped')}"
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.warn("[Drip] Interrupted — shutting down gracefully.")
+    finally:
+        await _close_db(db_pool)
+
+
+# ---------------------------------------------------------------------------
 # Mode: --demo
 # ---------------------------------------------------------------------------
 
@@ -802,6 +869,44 @@ def main() -> None:
         except KeyboardInterrupt:
             log.warn("Worker interrupted by user.")
 
+    elif mode == "--ingest-domain":
+        rest = args_no_db[1:]
+        limit = 1500
+        if "--limit" in rest:
+            i = rest.index("--limit")
+            if i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                del rest[i:i + 2]
+        targets = [a for a in rest if not a.startswith("--")]
+        if not targets:
+            log.error("--ingest-domain requires a domain URL.")
+            log.error("  Usage: python main.py --ingest-domain <url> [--limit N] [--db]")
+            sys.exit(1)
+        try:
+            asyncio.run(cmd_ingest_domain(targets[0], use_db=use_db, daily_page_limit=limit))
+        except KeyboardInterrupt:
+            log.warn("Ingest interrupted by user.")
+
+    elif mode == "--drip":
+        rest = args_no_db[1:]
+        limit = 1500
+        if "--limit" in rest:
+            i = rest.index("--limit")
+            if i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                del rest[i:i + 2]
+        dom = next((a for a in rest if not a.startswith("--")), None)
+        try:
+            asyncio.run(cmd_drip(use_db=use_db, domain=dom, daily_page_limit=limit))
+        except KeyboardInterrupt:
+            log.warn("Drip worker interrupted by user.")
+
     elif mode == "--demo":
         try:
             asyncio.run(cmd_demo(use_db=use_db))
@@ -842,6 +947,8 @@ def main() -> None:
                 f"Unknown mode: {mode!r}\n"
                 "Usage:\n"
                 "  python main.py --crawl <url> [url…] [--db]\n"
+                "  python main.py --ingest-domain <url> [--limit N] [--db]\n"
+                "  python main.py --drip [domain] [--limit N] --db\n"
                 "  python main.py --worker --db\n"
                 "  python main.py --demo [--db]\n"
                 "  python main.py --dashboard [--port 8000]\n"

@@ -272,6 +272,91 @@ async def api_stats():
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Autonomous crawl monitor + domain ingestion (Step 6)
+# ---------------------------------------------------------------------------
+
+@app.get("/crawl", response_class=HTMLResponse)
+async def crawl_monitor_page(request: Request, message: Optional[str] = None):
+    domains = await queries.list_crawl_domains(db_pool)
+    return templates.TemplateResponse(
+        request=request,
+        name="crawl.html",
+        context={
+            "active_page": "crawl",
+            "domains": domains,
+            "message": message,
+            "csrf_token": _csrf_value(),
+        },
+    )
+
+
+@app.post("/api/domains/add", dependencies=[Depends(require_csrf)])
+async def add_domain(
+    background_tasks: BackgroundTasks,
+    domain: str = Form(...),
+    daily_page_limit: int = Form(1500),
+):
+    """Kick off autonomous catalog discovery for a domain, then drip-crawl it."""
+    domain = domain.strip()
+    if not domain:
+        raise HTTPException(status_code=400, detail="Domain URL is required.")
+
+    async def _run_ingest_bg(url: str, limit: int):
+        import discovery
+        from llm_pool import MultiKeyLLMPool
+
+        try:
+            summary = await discovery.ingest_domain(
+                url, db_pool, daily_page_limit=limit, settings=settings
+            )
+            log.info(
+                f"[Dashboard] Ingested {summary.get('domain')}: "
+                f"discovered={summary.get('discovered')} enqueued={summary.get('enqueued')}"
+            )
+            llm_pool = None
+            try:
+                llm_pool = MultiKeyLLMPool.from_settings(settings)
+            except Exception:
+                pass
+            await discovery.run_drip_worker(
+                db_pool, domain=summary.get("domain"), settings=settings,
+                llm_pool=llm_pool, daily_page_limit=limit,
+            )
+        except Exception as exc:
+            log.error(f"[Dashboard] Domain ingest failed for {url}: {exc}")
+
+    background_tasks.add_task(_run_ingest_bg, domain, daily_page_limit)
+    return RedirectResponse(
+        url=f"/crawl?message=Discovery+launched+for+{domain}.+The+drip+crawler+will+scrape+the+catalog+over+the+coming+hours.",
+        status_code=303,
+    )
+
+
+@app.post("/api/chat")
+async def api_chat(payload: Dict[str, Any]):
+    """Advisor RAG endpoint — grounded shopping advice over completed dossiers."""
+    query = (payload.get("query") or payload.get("message") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="A 'query' field is required.")
+    product_id = payload.get("product_id")
+
+    from advisor import advise
+    from llm_pool import MultiKeyLLMPool
+
+    llm_pool = None
+    try:
+        llm_pool = MultiKeyLLMPool.from_settings(settings)
+    except Exception:
+        pass
+
+    rec = await advise(
+        query, db_pool=db_pool, llm_pool=llm_pool, settings=settings,
+        product_id=product_id,
+    )
+    return rec.model_dump()
+
+
 def start_dashboard(host: str = "0.0.0.0", port: int = 8000) -> None:
     """Launch the dashboard server via uvicorn."""
     import uvicorn

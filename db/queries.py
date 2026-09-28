@@ -784,3 +784,266 @@ async def get_product_detail_with_dossier(
         "teardowns": [dict(r) for r in teardown_rows],
     }
 
+
+# ---------------------------------------------------------------------------
+# Crawl queue helpers — autonomous domain-wide discovery + drip scrape
+# ---------------------------------------------------------------------------
+
+async def enqueue_crawl_urls(
+    pool: Optional[object],
+    *,
+    domain: str,
+    urls: List[str],
+    depth: int = 0,
+) -> int:
+    """Bulk-insert discovered URLs into crawl_queue. Returns rows actually added.
+
+    Idempotent: ``ON CONFLICT (url) DO NOTHING`` so re-discovering the same URL
+    across runs never duplicates a row. No-op (returns 0) in dry-run mode.
+    """
+    if pool is None or not urls:
+        return 0
+    # De-dup within the batch while preserving order.
+    seen: set = set()
+    rows = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            rows.append((domain, u, depth))
+    if not rows:
+        return 0
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        before = await conn.fetchval("SELECT COUNT(*) FROM crawl_queue WHERE domain = $1", domain)
+        await conn.executemany(
+            """
+            INSERT INTO crawl_queue (domain, url, depth)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (url) DO NOTHING
+            """,
+            rows,
+        )
+        after = await conn.fetchval("SELECT COUNT(*) FROM crawl_queue WHERE domain = $1", domain)
+    return int((after or 0) - (before or 0))
+
+
+async def claim_next_crawl_url(
+    pool: Optional[object],
+    domain: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the oldest pending crawl URL (optionally per-domain).
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple drip workers never collide.
+    Marks the row ``in_progress`` and returns it, or None when nothing pending.
+    """
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        async with conn.transaction():
+            if domain:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, domain, url, depth, attempts
+                    FROM crawl_queue
+                    WHERE status = 'pending' AND domain = $1
+                    ORDER BY discovered_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    domain,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, domain, url, depth, attempts
+                    FROM crawl_queue
+                    WHERE status = 'pending'
+                    ORDER BY discovered_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                )
+            if row is None:
+                return None
+            await conn.execute(
+                """
+                UPDATE crawl_queue
+                SET status = 'in_progress', claimed_at = NOW(), attempts = attempts + 1
+                WHERE id = $1
+                """,
+                row["id"],
+            )
+    return dict(row)
+
+
+async def complete_crawl_url(pool: Optional[object], url: str) -> None:
+    """Mark a crawl URL as successfully scraped."""
+    if pool is None:
+        return
+    await pool.execute(  # type: ignore[attr-defined]
+        "UPDATE crawl_queue SET status = 'completed', completed_at = NOW() WHERE url = $1",
+        url,
+    )
+
+
+async def fail_crawl_url(pool: Optional[object], url: str, error_msg: str) -> None:
+    """Mark a crawl URL as failed with a (truncated) error message."""
+    if pool is None:
+        return
+    await pool.execute(  # type: ignore[attr-defined]
+        """
+        UPDATE crawl_queue
+        SET status = 'failed', error_msg = $2, completed_at = NOW()
+        WHERE url = $1
+        """,
+        url, (error_msg or "")[:2000],
+    )
+
+
+async def get_crawl_queue_stats(
+    pool: Optional[object],
+    domain: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return crawl-queue counters for the dashboard monitor page.
+
+    When ``domain`` is given the counts are scoped to that domain; otherwise
+    aggregated across all domains. ``pages_scraped_today`` counts rows that
+    completed since local midnight (UTC).
+    """
+    empty = {
+        "domain": domain,
+        "total": 0, "pending": 0, "in_progress": 0,
+        "completed": 0, "failed": 0, "pages_scraped_today": 0,
+        "last_error": None,
+    }
+    if pool is None:
+        return empty
+    where = "WHERE domain = $1" if domain else ""
+    args = [domain] if domain else []
+    row = await pool.fetchrow(  # type: ignore[attr-defined]
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE status = 'pending')      AS pending,
+            COUNT(*) FILTER (WHERE status = 'in_progress')  AS in_progress,
+            COUNT(*) FILTER (WHERE status = 'completed')    AS completed,
+            COUNT(*) FILTER (WHERE status = 'failed')       AS failed,
+            COUNT(*) FILTER (WHERE status = 'completed'
+                             AND completed_at >= date_trunc('day', NOW())) AS pages_scraped_today
+        FROM crawl_queue
+        {where}
+        """,
+        *args,
+    )
+    err_row = await pool.fetchrow(  # type: ignore[attr-defined]
+        f"""
+        SELECT error_msg FROM crawl_queue
+        {where + ' AND ' if where else 'WHERE '}error_msg IS NOT NULL
+        ORDER BY completed_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        *args,
+    )
+    out = dict(row) if row else dict(empty)
+    out["domain"] = domain
+    out["last_error"] = err_row["error_msg"] if err_row else None
+    return out
+
+
+async def list_crawl_domains(pool: Optional[object]) -> List[Dict[str, Any]]:
+    """Per-domain crawl progress rollup for the dashboard monitor."""
+    if pool is None:
+        return []
+    rows = await pool.fetch(  # type: ignore[attr-defined]
+        """
+        SELECT domain,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE status = 'pending')     AS pending,
+               COUNT(*) FILTER (WHERE status = 'completed')   AS completed,
+               COUNT(*) FILTER (WHERE status = 'failed')      AS failed,
+               COUNT(*) FILTER (WHERE status = 'completed'
+                                AND completed_at >= date_trunc('day', NOW())) AS scraped_today,
+               MAX(discovered_at) AS last_discovered
+        FROM crawl_queue
+        GROUP BY domain
+        ORDER BY last_discovered DESC
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Domain profile helpers — cached zero-selector extraction hints
+# ---------------------------------------------------------------------------
+
+async def get_domain_profile(
+    pool: Optional[object],
+    domain: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the cached selector profile for a domain, or None."""
+    if pool is None:
+        return None
+    row = await pool.fetchrow(  # type: ignore[attr-defined]
+        """
+        SELECT domain, title_selector, price_selector, stock_selector,
+               specs_table_selector, extraction_tier, success_count, failure_count
+        FROM domain_profiles
+        WHERE domain = $1
+        """,
+        domain,
+    )
+    return dict(row) if row else None
+
+
+async def upsert_domain_profile(
+    pool: Optional[object],
+    *,
+    domain: str,
+    title_selector: Optional[str] = None,
+    price_selector: Optional[str] = None,
+    stock_selector: Optional[str] = None,
+    specs_table_selector: Optional[str] = None,
+    extraction_tier: Optional[str] = None,
+) -> None:
+    """Insert or update the cached CSS-selector profile for a domain (Tier 2)."""
+    if pool is None:
+        return
+    await pool.execute(  # type: ignore[attr-defined]
+        """
+        INSERT INTO domain_profiles
+            (domain, title_selector, price_selector, stock_selector,
+             specs_table_selector, extraction_tier, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6, NOW())
+        ON CONFLICT (domain) DO UPDATE
+            SET title_selector       = COALESCE(EXCLUDED.title_selector, domain_profiles.title_selector),
+                price_selector       = COALESCE(EXCLUDED.price_selector, domain_profiles.price_selector),
+                stock_selector       = COALESCE(EXCLUDED.stock_selector, domain_profiles.stock_selector),
+                specs_table_selector = COALESCE(EXCLUDED.specs_table_selector, domain_profiles.specs_table_selector),
+                extraction_tier      = COALESCE(EXCLUDED.extraction_tier, domain_profiles.extraction_tier),
+                updated_at           = NOW()
+        """,
+        domain, title_selector, price_selector, stock_selector,
+        specs_table_selector, extraction_tier,
+    )
+
+
+async def record_domain_profile_result(
+    pool: Optional[object],
+    domain: str,
+    success: bool,
+) -> None:
+    """Increment the success/failure counter for a domain's cached profile."""
+    if pool is None:
+        return
+    col = "success_count" if success else "failure_count"
+    await pool.execute(  # type: ignore[attr-defined]
+        f"""
+        INSERT INTO domain_profiles (domain, {col})
+        VALUES ($1, 1)
+        ON CONFLICT (domain) DO UPDATE
+            SET {col} = domain_profiles.{col} + 1,
+                updated_at = NOW()
+        """,
+        domain,
+    )
+
+

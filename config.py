@@ -174,6 +174,58 @@ class Settings:
     import_duty_factor: float = field(
         default_factory=lambda: _env_float("IMPORT_DUTY_FACTOR", 1.075)
     )
+    # Live FX rates are cached (Postgres/Redis) for this many seconds (24h).
+    fx_cache_ttl_s: int = field(default_factory=lambda: _env_int("FX_CACHE_TTL_S", 86_400))
+    # Optional ExchangeRate-API key (https://www.exchangerate-api.com). When set,
+    # the v6 keyed endpoint is preferred over the open er-api endpoint.
+    exchangerate_api_key: Optional[str] = field(
+        default_factory=lambda: _env_str("EXCHANGERATE_API_KEY")
+    )
+
+    # --- External search API (real defect mining, Phase 3) ---------------- #
+    # Provider is auto-selected from whichever key is present, or forced via
+    # SEARCH_PROVIDER (tavily | brave | serpapi | none). With no key the
+    # forensic phase logs `search_skipped_no_api_key` and marks the dossier
+    # confidence 'low_data' rather than fabricating sources.
+    search_provider: Optional[str] = field(
+        default_factory=lambda: _env_str("SEARCH_PROVIDER")
+    )
+    tavily_api_key: Optional[str] = field(default_factory=lambda: _env_str("TAVILY_API_KEY"))
+    brave_api_key: Optional[str] = field(default_factory=lambda: _env_str("BRAVE_API_KEY"))
+    serpapi_api_key: Optional[str] = field(default_factory=lambda: _env_str("SERPAPI_API_KEY"))
+    search_max_results: int = field(default_factory=lambda: _env_int("SEARCH_MAX_RESULTS", 5))
+
+    # --- Autonomous drip crawler (domain-wide discovery) ------------------ #
+    # Default budget of product pages fetched per domain per day.
+    drip_daily_page_limit: int = field(
+        default_factory=lambda: _env_int("DRIP_DAILY_PAGE_LIMIT", 1500)
+    )
+    # Randomized polite delay (seconds) between requests to the SAME domain.
+    drip_min_delay_s: float = field(default_factory=lambda: _env_float("DRIP_MIN_DELAY_S", 4.0))
+    drip_max_delay_s: float = field(default_factory=lambda: _env_float("DRIP_MAX_DELAY_S", 12.0))
+    # Hard cap on concurrent page fetches (4 GB VPS memory ceiling).
+    drip_max_concurrency: int = field(
+        default_factory=lambda: _env_int("DRIP_MAX_CONCURRENCY", 2)
+    )
+    # Recycle the browser/HTTP context every N pages to bound memory growth.
+    drip_context_recycle_pages: int = field(
+        default_factory=lambda: _env_int("DRIP_CONTEXT_RECYCLE_PAGES", 100)
+    )
+    # Soft RSS ceiling (MB); the worker pauses + GCs when exceeded.
+    drip_mem_soft_limit_mb: int = field(
+        default_factory=lambda: _env_int("DRIP_MEM_SOFT_LIMIT_MB", 1500)
+    )
+    # Domain circuit breaker: after N consecutive 403/429/503s, pause the domain.
+    circuit_breaker_threshold: int = field(
+        default_factory=lambda: _env_int("CIRCUIT_BREAKER_THRESHOLD", 5)
+    )
+    circuit_breaker_cooldown_s: int = field(
+        default_factory=lambda: _env_int("CIRCUIT_BREAKER_COOLDOWN_S", 3600)
+    )
+    # Max pages BFS spidering will enqueue per domain when no sitemap is found.
+    discovery_max_spider_pages: int = field(
+        default_factory=lambda: _env_int("DISCOVERY_MAX_SPIDER_PAGES", 500)
+    )
 
     # --- Forensic phase timeouts (seconds) -------------------------------- #
     forensic_phase1_timeout_s: int = field(
@@ -207,6 +259,27 @@ class Settings:
     def dashboard_auth_enabled(self) -> bool:
         """True when an admin key is configured (dashboard requires auth)."""
         return bool(self.admin_dashboard_key)
+
+    @property
+    def active_search_provider(self) -> Optional[str]:
+        """Resolve the effective search provider from explicit setting or keys.
+
+        Returns one of ``"tavily"``, ``"brave"``, ``"serpapi"`` or ``None`` when
+        no usable key is configured. An explicit ``SEARCH_PROVIDER`` wins only if
+        its matching key is present; otherwise we auto-select by key precedence.
+        """
+        forced = (self.search_provider or "").strip().lower()
+        keyed = {
+            "tavily": self.tavily_api_key,
+            "brave": self.brave_api_key,
+            "serpapi": self.serpapi_api_key,
+        }
+        if forced in keyed and keyed[forced]:
+            return forced
+        for name in ("tavily", "brave", "serpapi"):
+            if keyed[name]:
+                return name
+        return None
 
     @property
     def gemini_api_keys(self) -> List[str]:

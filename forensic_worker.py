@@ -185,6 +185,53 @@ async def _phase1_ground_truth(
     return dumped
 
 
+_FX_CACHE: Dict[str, Any] = {"rates": None, "fetched_at": 0.0}
+_FX_FALLBACK = {"LKR": 305.0, "AED": 3.67}  # conservative USD-base fallbacks
+
+
+async def _fetch_fx_rates(settings: Settings) -> tuple[Dict[str, float], bool]:
+    """Return (usd_base_rates, stale) with a process-wide 24h cache.
+
+    Prefers the keyed ExchangeRate-API v6 endpoint when ``exchangerate_api_key``
+    is set, else the open er-api endpoint (``fx_api_url``). Extracts USD→LKR and
+    USD→AED. On any failure falls back to conservative cached constants and flags
+    the result stale.
+    """
+    import time as _time
+
+    now = _time.time()
+    cached = _FX_CACHE.get("rates")
+    if cached and (now - _FX_CACHE.get("fetched_at", 0.0)) < settings.fx_cache_ttl_s:
+        return cached, False
+
+    url = settings.fx_api_url
+    if settings.exchangerate_api_key:
+        url = f"https://v6.exchangerate-api.com/v6/{settings.exchangerate_api_key}/latest/USD"
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            rates = data.get("rates") or data.get("conversion_rates") or {}
+            out = {
+                "LKR": rates.get("LKR"),
+                "AED": rates.get("AED"),
+            }
+            if out["LKR"]:
+                if not out["AED"]:
+                    out["AED"] = _FX_FALLBACK["AED"]
+                _FX_CACHE["rates"] = out
+                _FX_CACHE["fetched_at"] = now
+                return out, False
+    except Exception as exc:
+        log.warn(f"[Forensic P2] Live FX fetch failed: {exc}, using fallback")
+
+    return dict(_FX_FALLBACK), True
+
+
 async def _phase2_fx_arbitrage(
     ctx: ForensicContext,
     db_pool: Optional[object],
@@ -192,29 +239,22 @@ async def _phase2_fx_arbitrage(
     settings: Settings,
     ground_truth: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Phase 2: FX arbitrage and price-gouging classification with multi-currency support."""
-    import httpx
+    """Phase 2: Live multi-currency FX arbitrage and price-gouging classification.
 
+    Fetches USD/LKR and AED/LKR (24h cached), computes true landed cost against
+    the official USD MSRP, and classifies the merchant markup as
+    ``sub_msrp_likely_grey`` / ``fair_import_margin`` / ``price_gouged``.
+    """
     msrp_usd: Optional[float] = ground_truth.get("launch_msrp_usd")
     merchant_price = ctx.scraped_item.price_lkr
 
-    # Live FX rate fetch with fallback to cached rate and staleness flag (Rule #89)
-    fx_rate: Optional[float] = None
-    fx_stale = False
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(settings.fx_api_url)
-            if resp.status_code == 200:
-                data = resp.json()
-                rates = data.get("rates", {})
-                fx_rate = rates.get("LKR")
-    except Exception as exc:
-        log.warn(f"[Forensic P2] Live FX fetch failed: {exc}, using cached fallback")
-        fx_rate = 305.0  # Conservative cached fallback rate
-        fx_stale = True
-
+    rates, fx_stale = await _fetch_fx_rates(settings)
+    fx_rate: Optional[float] = rates.get("LKR")
+    usd_aed: Optional[float] = rates.get("AED")
+    # AED→LKR cross rate (LKR-per-AED) for Gulf grey-import benchmarking.
+    aed_lkr: Optional[float] = round(fx_rate / usd_aed, 4) if fx_rate and usd_aed else None
     if not fx_rate:
-        fx_rate = 305.0
+        fx_rate = _FX_FALLBACK["LKR"]
         fx_stale = True
 
     true_landed: Optional[float] = None
@@ -235,6 +275,7 @@ async def _phase2_fx_arbitrage(
         "global_msrp_usd": msrp_usd,
         "us_msrp_usd": msrp_usd,
         "fx_rate_usd_lkr": fx_rate,
+        "fx_rate_aed_lkr": aed_lkr,
         "fx_stale": fx_stale,
         "true_landed_cost_lkr": true_landed,
         "merchant_price_lkr": merchant_price,
@@ -271,70 +312,84 @@ async def _phase3_defect_mining(
     llm_pool: object,
     settings: Settings,
 ) -> List[Dict[str, Any]]:
-    """Phase 3: Deep defect mining & teardown analysis with >=2 source corroboration rule.
+    """Phase 3: Real search-powered defect mining with >=2 source corroboration.
 
-    Searches public discussion snippets (Reddit, XDA, repair forums) via DuckDuckGo
-    HTML query to avoid direct unauthenticated Reddit JSON 403s on datacenter IPs.
-    Applies strict >=2 independent source corroboration rule before persisting to dossier.
+    Uses the configured web-search provider (Tavily / Brave / SerpAPI via
+    ``search_client``) to gather genuine discussion snippets, then has the LLM
+    extract corroborated hardware defects. When no search API key is configured
+    we NEVER fabricate: the dossier is stamped ``confidence_label='low_data'``
+    and an empty defect list is returned.
     """
-    import httpx
+    from search_client import SearchClient, build_defect_queries
 
     spec = ctx.spec
     product_query = f"{spec.brand} {spec.model_family} {spec.sub_model}".strip()
 
-    evidence_items: List[Dict[str, str]] = []
+    search = SearchClient(settings)
 
-    # Source 1: DuckDuckGo search for Reddit & forum defect threads (safe against 403s)
-    try:
-        ddg_q = quote_plus(f"site:reddit.com {product_query} defect problem issue fail")
-        ddg_url = f"https://html.duckduckgo.com/html/?q={ddg_q}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(ddg_url)
-            if resp.status_code == 200:
-                matches = re.findall(
-                    r'<a class="result__snippet[^>]*>(.*?)</a>',
-                    resp.text,
-                    re.DOTALL,
+    # No provider key → log, stamp the dossier low_data, and return WITHOUT
+    # inventing defects from the LLM's parametric memory.
+    if not search.enabled:
+        log.warn("[Forensic P3] search_skipped_no_api_key — defect mining degraded to low_data.")
+        if db_pool is not None:
+            try:
+                from db import queries
+                await queries.upsert_defect_dossier(
+                    db_pool,
+                    product_id=ctx.product_id,
+                    defects=[],
+                    source_count=0,
+                    confidence_label="low_data",
+                    astroturf_risk_score=0.0,
+                    sponsored_content_ratio=0.0,
                 )
-                for snippet in matches[:15]:
-                    clean = re.sub(r'<[^>]+>', '', snippet).strip()
-                    if clean:
-                        evidence_items.append({"source": "reddit/web", "text": clean})
-    except Exception as exc:
-        log.warn(f"[Forensic P3] DDG defect search note: {exc}")
+            except Exception as exc:
+                log.warn(f"[Forensic P3] low_data dossier write failed: {exc}")
+        return []
 
-    # Source 2: Direct Reddit API attempt as secondary source
-    try:
-        reddit_q = quote_plus(f"{product_query} defect problem issue")
-        url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=15&type=link"
-        async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "KalaBalana/1.0"}) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                children = data.get("data", {}).get("children", [])
-                for child in children:
-                    pd = child.get("data", {})
-                    title = pd.get("title", "")
-                    selftext = (pd.get("selftext") or "")[:400]
-                    evidence_items.append({
-                        "source": f"reddit:r/{pd.get('subreddit')}",
-                        "text": f"{title} — {selftext}",
-                    })
-    except Exception as exc:
-        log.debug(f"[Forensic P3] Reddit direct search note: {exc}")
+    # Gather real snippets across the defect queries; keep the top 5 overall.
+    evidence_items: List[Dict[str, str]] = []
+    for query in build_defect_queries(spec.brand, product_query):
+        try:
+            hits = await search.search(query, max_results=5)
+        except Exception as exc:
+            log.debug(f"[Forensic P3] search note for {query!r}: {exc}")
+            continue
+        for hit in hits:
+            text = (hit.snippet or hit.title or "").strip()
+            if text:
+                evidence_items.append({"source": hit.url or hit.source, "text": text})
 
+    # De-dup by text, keep the strongest 5 snippets.
+    seen_txt: set = set()
+    deduped: List[Dict[str, str]] = []
+    for item in evidence_items:
+        key = item["text"][:160]
+        if key not in seen_txt:
+            seen_txt.add(key)
+            deduped.append(item)
+    evidence_items = deduped[:5]
+
+    # Search enabled but yielded nothing usable → low_data, no fabrication.
     if not evidence_items:
-        # Fall back to prompting LLM with hardware knowledge if network search returned empty
-        evidence_items.append({
-            "source": "knowledge_base",
-            "text": f"Historical manufacturing defects, thermal throttling, green line display issues, tropical humidity failure modes for {product_query}",
-        })
+        log.warn("[Forensic P3] search returned no usable snippets — low_data.")
+        if db_pool is not None:
+            try:
+                from db import queries
+                await queries.upsert_defect_dossier(
+                    db_pool,
+                    product_id=ctx.product_id,
+                    defects=[],
+                    source_count=0,
+                    confidence_label="low_data",
+                    astroturf_risk_score=0.0,
+                    sponsored_content_ratio=0.0,
+                )
+            except Exception as exc:
+                log.warn(f"[Forensic P3] low_data dossier write failed: {exc}")
+        return []
 
-    evidence_text = "\n---\n".join(f"[{item['source']}] {item['text']}" for item in evidence_items[:20])
+    evidence_text = "\n---\n".join(f"[{item['source']}] {item['text']}" for item in evidence_items)
 
     prompt = (
         f"Product: {product_query}\n\n"

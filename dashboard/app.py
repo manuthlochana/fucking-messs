@@ -297,14 +297,19 @@ async def add_domain(
     domain: str = Form(...),
     daily_page_limit: int = Form(1500),
 ):
-    """Kick off autonomous catalog discovery for a domain, then drip-crawl it."""
+    """Kick off autonomous catalog discovery for a domain (enqueue only).
+
+    Discovery seeds ``crawl_queue``; the standalone ``worker.py`` process
+    (crawl consumer) renders and drains it. The dashboard no longer runs an
+    inline drip crawl — that would compete with the worker for the same queue
+    rows and block the web process. Start the worker with ``python worker.py``.
+    """
     domain = domain.strip()
     if not domain:
         raise HTTPException(status_code=400, detail="Domain URL is required.")
 
     async def _run_ingest_bg(url: str, limit: int):
         import discovery
-        from llm_pool import MultiKeyLLMPool
 
         try:
             summary = await discovery.ingest_domain(
@@ -312,23 +317,15 @@ async def add_domain(
             )
             log.info(
                 f"[Dashboard] Ingested {summary.get('domain')}: "
-                f"discovered={summary.get('discovered')} enqueued={summary.get('enqueued')}"
-            )
-            llm_pool = None
-            try:
-                llm_pool = MultiKeyLLMPool.from_settings(settings)
-            except Exception:
-                pass
-            await discovery.run_drip_worker(
-                db_pool, domain=summary.get("domain"), settings=settings,
-                llm_pool=llm_pool, daily_page_limit=limit,
+                f"discovered={summary.get('discovered')} enqueued={summary.get('enqueued')} "
+                f"— crawl_queue seeded; worker.py will drain it."
             )
         except Exception as exc:
             log.error(f"[Dashboard] Domain ingest failed for {url}: {exc}")
 
     background_tasks.add_task(_run_ingest_bg, domain, daily_page_limit)
     return RedirectResponse(
-        url=f"/crawl?message=Discovery+launched+for+{domain}.+The+drip+crawler+will+scrape+the+catalog+over+the+coming+hours.",
+        url=f"/crawl?message=Discovery+launched+for+{domain}.+URLs+are+queued;+the+background+worker+will+scrape+the+catalog+over+the+coming+hours.",
         status_code=303,
     )
 

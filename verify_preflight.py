@@ -7,7 +7,8 @@ refactor. It never touches the network or a live database. Checks, in order:
   1. Byte-compile every first-party module (syntax gate).
   2. Import the core modules (import-time gate).
   3. Confirm schema.sql declares the expected tables.
-  4. Load the YAML site profiles (with graceful PyYAML-absent degradation).
+  4. Confirm the queue pipeline is wired (worker → auto_extractor, no dead
+     site_profiles/selector logic left behind).
   5. Smoke-test the deterministic Track A extractor (BNPL markup + 2-of-3 stock).
 
 Exit code is 0 when every check passes, 1 otherwise — suitable for CI.
@@ -39,7 +40,6 @@ def check_compile() -> None:
     print("\n[1/5] Byte-compiling first-party modules…")
     modules = sorted(p for p in ROOT.glob("*.py") if p.name != "verify_preflight.py")
     modules += sorted((ROOT / "db").glob("*.py"))
-    modules += sorted((ROOT / "site_profiles").glob("*.py"))
     failures = 0
     for m in modules:
         try:
@@ -65,7 +65,7 @@ def check_imports() -> None:
         "discovery",
         "auto_extractor",
         "search_client",
-        "site_profiles.loader",
+        "worker",
     ]
     for name in core:
         try:
@@ -103,23 +103,44 @@ def check_schema() -> None:
     _record("partition maintenance fn", "ensure_monthly_partitions" in sql)
 
 
-def check_profiles() -> None:
-    print("\n[4/5] Loading site profiles…")
+def check_pipeline_wiring() -> None:
+    print("\n[4/5] Verifying queue pipeline wiring…")
     try:
-        from site_profiles import loader
+        # The background worker (crawl_queue consumer) must exist and expose the
+        # two consumer loops that make Dashboard → Queue → Worker → DB flow.
+        import worker
 
-        profiles = loader.load_all_profiles(force=True)
-        names = loader.list_profiles()
-        _record("site profiles loaded", len(profiles) >= 1,
-                f"{len(profiles)} profile(s): {', '.join(sorted(names))}")
-        # Domain resolution must always return *something* (generic fallback).
-        prof = loader.get_profile("https://sampleretailer.lk/product/x")
-        _record("get_profile resolves", prof is not None,
-                getattr(prof, "name", "?"))
-        if not getattr(loader, "_HAVE_YAML", True):
-            _record("PyYAML-absent degradation", True, "builtin generic fallback active")
+        _record("worker.run_worker present", callable(getattr(worker, "run_worker", None)))
+        _record("worker crawl consumer present",
+                callable(getattr(worker, "_crawl_consumer", None)))
+        _record("worker static fallback present",
+                callable(getattr(worker, "_crawl_consumer_static", None)))
+
+        # Extraction must route exclusively through the zero-selector authority.
+        crawler_src = (ROOT / "crawler.py").read_text(encoding="utf-8")
+        _record("crawler → auto_extractor", "extract_and_persist_html" in crawler_src)
+        _record("crawler has no legacy extract_product",
+                "def extract_product" not in crawler_src,
+                "old per-page extractor removed")
+
+        main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+        _record("main → auto_extractor",
+                "extract_and_persist_html" in main_src)
+        _record("main has no _extract_headline_fields",
+                "_extract_headline_fields" not in main_src,
+                "old headline/selector path removed")
+
+        # The old per-site selector library must be gone (no dead code).
+        _record("site_profiles/ removed", not (ROOT / "site_profiles").exists(),
+                "no legacy selector authoring")
+
+        # Discovery must be able to drive a headless browser for SPA sites.
+        import discovery
+        _record("discovery browser spider present",
+                callable(getattr(discovery, "spider_browser", None))
+                and callable(getattr(discovery, "crawl4ai_available", None)))
     except Exception as exc:
-        _record("site profiles", False, f"{type(exc).__name__}: {exc}")
+        _record("pipeline wiring", False, f"{type(exc).__name__}: {exc}")
 
 
 def check_extractor() -> None:
@@ -159,7 +180,7 @@ def main() -> int:
     check_compile()
     check_imports()
     check_schema()
-    check_profiles()
+    check_pipeline_wiring()
     check_extractor()
 
     passed = sum(1 for _, ok, _ in _results if ok)

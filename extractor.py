@@ -1,9 +1,10 @@
 """Track A commerce-forensics extractor.
 
-Track A is the *listing-time* extraction layer that runs during ingestion
-(see ``main.fetch_and_parse_product_page``). Where the LLM extractor in
-``crawler.py`` pulls the headline product fields, this module pulls the
-adversarial commerce signals a merchant would rather hide:
+Track A is the *listing-time* extraction layer that runs during ingestion.
+Where :mod:`auto_extractor` pulls the headline product fields (title, price,
+stock) via the zero-selector cascade, this module pulls the adversarial
+commerce signals a merchant would rather hide, and :func:`extract_track_a` is
+layered on top of every extraction by ``auto_extractor.extract_fields``:
 
 * **BNPL / installment plans** — the advertised teaser is usually the cash
   price; the true cost of an installment plan is ``cycles * installment``.
@@ -18,8 +19,8 @@ adversarial commerce signals a merchant would rather hide:
 
 Everything here is deterministic and dependency-light: pure regex/text logic
 that is trivially unit-testable without a browser, an LLM, or a database.
-HTML parsing (via the optional site profile) uses BeautifulSoup when present
-and degrades to raw-text regex otherwise.
+HTML parsing uses BeautifulSoup when present and degrades to raw-text regex
+otherwise.
 """
 
 from __future__ import annotations
@@ -402,7 +403,7 @@ def _visible_text(html_or_text: str) -> str:
         return re.sub(r"<[^>]+>", " ", html_or_text)
 
 
-def _button_signal(html: str, profile=None) -> Optional[bool]:
+def _button_signal(html: str) -> Optional[bool]:
     """Infer the buy-button stock signal from HTML (disabled attr / OOS class)."""
     if not html or "<" not in html:
         return None
@@ -421,18 +422,16 @@ def _button_signal(html: str, profile=None) -> Optional[bool]:
 def extract_track_a(
     html_or_text: str,
     cash_price: Optional[float] = None,
-    profile=None,
 ) -> TrackAExtras:
     """Run every Track A extractor over a DOM/text blob and bundle the results.
 
-    ``profile`` is an optional :class:`site_profiles.loader.SiteProfile`; when
-    present its selectors refine the button/stock signals. The function never
-    raises on malformed input — a bad blob yields empty results.
+    The function never raises on malformed input — a bad blob yields empty
+    results.
     """
     raw = html_or_text or ""
     text = _visible_text(raw)
 
-    button = _button_signal(raw, profile)
+    button = _button_signal(raw)
     stock = verify_stock(button_in_stock=button, schema_availability=None, stock_text=raw)
 
     return TrackAExtras(

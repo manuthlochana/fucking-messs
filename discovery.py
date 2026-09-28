@@ -9,12 +9,17 @@ Public API
 * :func:`ingest_domain` — discover product URLs and populate ``crawl_queue``.
 * :func:`run_drip_worker` — polite, memory-bounded queue consumer.
 
-Discovery strategy (no bs4/lxml/playwright — httpx + stdlib xml + regex only):
+Discovery strategy:
     1. Fetch ``robots.txt``; collect ``Sitemap:`` directives.
     2. Fetch each sitemap; recurse ``<sitemapindex>`` entries; harvest ``<loc>``.
     3. Keep only same-registered-domain, product-looking URLs.
-    4. If sitemaps yield nothing, BFS-spider from the homepage, following
-       same-domain links up to ``discovery_max_spider_pages``.
+    4. If sitemaps yield nothing, spider from the homepage following same-domain
+       links up to ``discovery_max_spider_pages``. When Crawl4AI is installed the
+       spider drives a **real headless browser** (``spider_browser``) so modern
+       React/Next.js SPA catalogs — whose product links are injected by
+       JavaScript and are invisible to a raw HTTP GET — are discovered. Only when
+       Crawl4AI is unavailable does it degrade to a static httpx+regex BFS
+       (``spider_bfs``), which under-discovers on SPA sites.
     5. Bulk-enqueue into ``crawl_queue`` (idempotent ON CONFLICT DO NOTHING).
 
 Drip worker (polite / self-throttling / memory-bounded):
@@ -42,6 +47,24 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from config import Settings, settings as default_settings
 from db import queries
 from logging_utils import log
+
+# --------------------------------------------------------------------------- #
+# Guarded Crawl4AI import — the browser is used for JS/SPA link discovery.
+# Absent it, discovery degrades to a static httpx + regex spider.
+# --------------------------------------------------------------------------- #
+try:  # pragma: no cover - import guard
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+
+    _CRAWL4AI_ERR: Optional[Exception] = None
+except Exception as _exc:  # pragma: no cover
+    AsyncWebCrawler = BrowserConfig = CrawlerRunConfig = CacheMode = None  # type: ignore
+    _CRAWL4AI_ERR = _exc
+
+
+def crawl4ai_available() -> bool:
+    """True when a headless browser can render SPA pages for link discovery."""
+    return _CRAWL4AI_ERR is None
+
 
 # --------------------------------------------------------------------------- #
 # URL heuristics
@@ -278,8 +301,108 @@ async def spider_bfs(
 
 
 # --------------------------------------------------------------------------- #
-# Public: ingest_domain — discover + populate crawl_queue
+# Headless-browser BFS (JS/SPA link discovery via Crawl4AI)
 # --------------------------------------------------------------------------- #
+def _browser_run_config(settings: Settings):
+    """A networkidle run-config so SPA JS finishes injecting product links."""
+    cache_mode = getattr(CacheMode, "BYPASS", None) if CacheMode is not None else None
+    return CrawlerRunConfig(
+        cache_mode=cache_mode,
+        wait_until="networkidle",  # wait for client-side rendering to settle
+        page_timeout=settings.stealth_page_timeout_ms,
+        delay_before_return_html=settings.stealth_settle_ms / 1000.0,
+        exclude_external_images=True,
+        screenshot=False,
+        remove_overlay_elements=True,
+        word_count_threshold=1,
+        verbose=False,
+    )
+
+
+async def _browser_links(crawler, url: str, settings: Settings) -> Tuple[Optional[int], List[str]]:
+    """Render one URL in the headless browser and return ``(status, links)``.
+
+    Combines Crawl4AI's post-render ``links['internal']`` (which captures anchors
+    the JS framework injected) with a regex sweep of the rendered HTML, so no
+    href is missed regardless of how the SPA emits it.
+    """
+    result = await crawler.arun(url=url, config=_browser_run_config(settings))
+    status = getattr(result, "status_code", None)
+    links: List[str] = []
+    raw = getattr(result, "links", None) or {}
+    internal = raw.get("internal", []) if isinstance(raw, dict) else []
+    for entry in internal:
+        href = entry.get("href") if isinstance(entry, dict) else entry
+        if href:
+            links.append(href)
+    html = getattr(result, "html", "") or getattr(result, "cleaned_html", "") or ""
+    links.extend(extract_links(html, url))
+    return status, links
+
+
+async def spider_browser(
+    origin: str,
+    *,
+    max_pages: int,
+    delay_range: Tuple[float, float],
+    settings: Settings = default_settings,
+) -> List[str]:
+    """BFS from the homepage using a REAL headless browser (Crawl4AI).
+
+    Product links on React/Next.js/Vue storefronts are injected after hydration
+    and are absent from the raw HTML, so a static GET spider finds nothing. This
+    renders each page (``wait_until='networkidle'``) before harvesting links.
+
+    Requires Crawl4AI — callers must gate on :func:`crawl4ai_available`.
+    """
+    if _CRAWL4AI_ERR is not None:  # pragma: no cover - guarded by caller
+        raise RuntimeError(f"crawl4ai unavailable: {_CRAWL4AI_ERR}")
+
+    base_dom = _registered_domain(origin)
+    browser_cfg = BrowserConfig(
+        headless=settings.headless,
+        text_mode=True,
+        light_mode=True,
+        verbose=False,
+        extra_args=settings.browser_args(),
+    )
+    queue: List[str] = [_canon(origin)]
+    visited: Set[str] = set()
+    products: Set[str] = set()
+    pages = 0
+
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        while queue and pages < max_pages:
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            try:
+                _, links = await _browser_links(crawler, url, settings)
+            except Exception as exc:
+                log.debug(f"[Discovery] browser render failed {url}: {exc!r}")
+                continue
+            pages += 1
+            for link in links:
+                if _registered_domain(link) != base_dom:
+                    continue
+                cu = _canon(link)
+                if is_product_url(cu):
+                    products.add(cu)
+                if (
+                    cu not in visited
+                    and not _SKIP_URL_RE.search(cu)
+                    and len(visited) + len(queue) < max_pages * 4
+                ):
+                    queue.append(cu)
+            lo, hi = delay_range
+            if hi > 0:
+                await asyncio.sleep(random.uniform(lo, hi))
+
+    log.info(f"[Discovery] browser spider rendered {pages} page(s), "
+             f"found {len(products)} product URL(s)")
+    return sorted(products)
+
 async def ingest_domain(
     domain_url: str,
     pool: Optional[object],
@@ -322,16 +445,30 @@ async def ingest_domain(
         log.info(f"sitemap discovery: {len(product_urls)} product URL(s) from "
                  f"{len(sitemaps)} sitemap(s)")
 
-        # 3. spider fallback
+        # 3. spider fallback — headless browser (SPA-aware) when available.
         if not product_urls:
-            method = "spider"
-            log.warn("no product URLs from sitemaps — falling back to BFS spider")
-            product_urls = await spider_bfs(
-                client, origin,
-                max_pages=settings.discovery_max_spider_pages,
-                delay_range=(settings.drip_min_delay_s, settings.drip_max_delay_s),
-            )
-            log.info(f"spider discovery: {len(product_urls)} product URL(s)")
+            if crawl4ai_available():
+                method = "browser_spider"
+                log.warn("no product URLs from sitemaps — falling back to "
+                         "headless-browser BFS (renders SPA/JS catalogs)")
+                product_urls = await spider_browser(
+                    origin,
+                    max_pages=settings.discovery_max_spider_pages,
+                    delay_range=(settings.drip_min_delay_s, settings.drip_max_delay_s),
+                    settings=settings,
+                )
+                log.info(f"browser spider discovery: {len(product_urls)} product URL(s)")
+            else:
+                method = "spider"
+                log.warn("no product URLs from sitemaps AND crawl4ai is unavailable "
+                         "— falling back to static httpx BFS (SPA sites will "
+                         "under-discover; install crawl4ai for JS rendering)")
+                product_urls = await spider_bfs(
+                    client, origin,
+                    max_pages=settings.discovery_max_spider_pages,
+                    delay_range=(settings.drip_min_delay_s, settings.drip_max_delay_s),
+                )
+                log.info(f"static spider discovery: {len(product_urls)} product URL(s)")
 
     # Respect the per-run daily budget cap on how many we enqueue at once.
     capped = product_urls[: max(1, daily_page_limit)] if daily_page_limit else product_urls

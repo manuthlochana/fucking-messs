@@ -179,83 +179,6 @@ def _map_warranty_tier(warranty_claimed: Optional[str]) -> str:
     return "unstated"
 
 
-async def _extract_headline_fields(
-    url: str,
-    html: str,
-    llm: Optional[object],
-) -> Optional["object"]:
-    """Return a validated ``ScrapedProductItem`` for the page.
-
-    Prefers the LLM structured extractor (same contract as
-    ``crawler.AntiFragileCrawler.extract_product``); on failure or when no LLM
-    is configured, falls back to deterministic regex anchors so ingestion still
-    yields a row in dry-run / offline mode. Returns ``None`` if even the
-    deterministic path cannot recover a usable price.
-    """
-    import re
-
-    from schemas import ScrapedProductItem
-
-    # --- Preferred path: LLM structured extraction ------------------------- #
-    if llm is not None:
-        try:
-            from crawler import EXTRACTION_SYSTEM_INSTRUCTION
-            from schemas import ProductExtraction
-
-            budget = min(len(html), settings.sentry_char_budget * 3)
-            prompt = (
-                f"Product URL: {url}\n"
-                "Extract the product from this page content:\n"
-                "----- BEGIN PAGE CONTENT -----\n"
-                f"{html[:budget]}\n"
-                "----- END PAGE CONTENT -----"
-            )
-            extraction = await llm.generate_structured(  # type: ignore[attr-defined]
-                prompt,
-                ProductExtraction,
-                system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
-                temperature=0.0,
-                max_output_tokens=1024,
-            )
-            return extraction.to_item(url)
-        except Exception as exc:
-            log.warn(f"[Ingest] LLM extraction failed ({exc}); using deterministic fallback.")
-
-    # --- Deterministic fallback (mirrors the delta-poll regex anchors) ----- #
-    price: Optional[float] = None
-    json_ld_m = re.search(r'"price"\s*:\s*["\']?([\d,]+(?:\.\d{2})?)["\']?', html, re.I)
-    if json_ld_m:
-        try:
-            price = float(json_ld_m.group(1).replace(",", "")) or None
-        except ValueError:
-            price = None
-    if price is None:
-        lkr_m = re.search(r'(?:Rs\.?|LKR)\s*([\d,]{3,}(?:\.\d{2})?)', html, re.I)
-        if lkr_m:
-            try:
-                price = float(lkr_m.group(1).replace(",", "")) or None
-            except ValueError:
-                price = None
-    if not price or price <= 0:
-        return None
-
-    title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-    raw_title = (title_m.group(1).strip() if title_m else url)[:300] or url
-    oos = re.search(r"\b(out of stock|sold out|unavailable|discontinued)\b", html, re.I)
-    in_stock_hit = re.search(r"\b(in stock|add to cart|buy now)\b", html, re.I)
-    in_stock = not (oos and not in_stock_hit)
-
-    try:
-        return ScrapedProductItem(
-            raw_title=raw_title,
-            clean_title=raw_title,
-            brand=None,
-            price_lkr=price,
-            in_stock=in_stock,
-        )
-    except Exception:
-        return None
-
 
 async def fetch_and_parse_product_page(
     url: str,
@@ -265,28 +188,25 @@ async def fetch_and_parse_product_page(
     *,
     timeout_s: float = 20.0,
 ) -> Dict[str, Any]:
-    """Fetch one product page, extract, normalize, and persist atomically.
+    """Fetch one product page (static httpx) and extract + persist it.
 
-    This is the standalone single-URL ingestion entrypoint that Track A refers
-    to (see ``extractor.py``'s module docstring). Flow:
+    Single-URL ingestion entrypoint. The DOM is fetched with httpx and handed
+    verbatim to :func:`auto_extractor.extract_and_persist_html` — the one
+    extraction authority shared with the crawler and the drip worker: the
+    zero-selector 3-tier cascade (JSON-LD -> cached domain strategy -> LLM),
+    Track-A commerce signals, an atomic Postgres upsert, and a durable
+    ``forensic_queue`` enqueue for genuinely new products.
 
-        fetch DOM (httpx)
-          → resolve domain profile (site_profiles.loader.get_profile)
-          → Track A commerce signals (extractor.extract_track_a)
-          → headline fields (LLM structured extraction, else deterministic regex)
-          → spec normalization (normalizer.SpecNormalizer)
-          → atomic Postgres upsert + durable forensic_queue enqueue.
-
-    Durable queue state lives in Postgres ``forensic_queue`` (the crawler's
-    HashRing is the only Redis-backed structure and covers URL dedup, not job
-    state). Never raises — returns a result dict describing the outcome.
+    This path does NOT render JavaScript; SPA/React storefronts must be crawled
+    through ``worker.py`` (or ``crawler.AntiFragileCrawler``), which drives a
+    real headless browser. The ``llm`` parameter is accepted for call-site
+    compatibility but unused — Tier-3 inference uses ``llm_pool``. Never raises.
     """
-    import re
-    from urllib.parse import urlsplit
+    from auto_extractor import extract_and_persist_html
 
     result: Dict[str, Any] = {"url": url, "status": "error", "notes": []}
 
-    # 1. Fetch the DOM.
+    # 1. Fetch the DOM (static HTML only).
     headers = {
         "User-Agent": settings.user_agent
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -311,133 +231,10 @@ async def fetch_and_parse_product_page(
         log.warn(f"[Ingest] fetch failed for {url}: {exc}")
         return result
 
-    # 2. Resolve the site profile (never fatal — falls back to the generic one).
-    profile = None
-    try:
-        from site_profiles.loader import get_profile
-
-        profile = get_profile(url)
-        result["profile"] = getattr(profile, "name", None)
-    except Exception as exc:
-        result["notes"].append(f"profile load skipped: {exc}")
-
-    # 3. Headline fields (LLM structured, else deterministic).
-    item = await _extract_headline_fields(url, html, llm)
-    if item is None:
-        result["status"] = "extract_failed"
-        result["notes"].append("no usable product price recovered")
-        return result
-
-    # 4. Track A commerce signals (BNPL markup, 2-of-3 stock, promos, surcharges).
-    try:
-        from extractor import extract_track_a
-
-        track_a = extract_track_a(html, cash_price=item.price_lkr, profile=profile)
-        result["track_a"] = {
-            "bnpl_plans": len(track_a.bnpl_plans),
-            "bank_promos": len(track_a.bank_promos),
-            "surcharges": len(track_a.surcharges),
-            "stock_verdict": track_a.stock.in_stock,
-            "stock_confidence": track_a.stock.confidence,
-        }
-        # A 2-of-3-verified stock verdict overrides the headline in_stock flag.
-        if track_a.stock.agreement_reached and track_a.stock.in_stock is not None:
-            item.in_stock = bool(track_a.stock.in_stock)
-    except Exception as exc:
-        track_a = None
-        result["notes"].append(f"track_a skipped: {exc}")
-
-    # 5. Normalize the title into a canonical spec fingerprint.
-    from normalizer import SpecNormalizer
-
-    spec = SpecNormalizer().normalize(item.raw_title, brand_hint=item.brand)
-    result["fingerprint"] = spec.spec_fingerprint[:16]
-
-    # 6. Dry-run mode: nothing to persist.
-    if db_pool is None:
-        result["status"] = "extracted_dry_run"
-        result["price_lkr"] = item.price_lkr
-        result["in_stock"] = item.in_stock
-        log.info(
-            f"[Ingest] (dry-run) {item.clean_title} — LKR {item.price_lkr:,.2f} "
-            f"in_stock={item.in_stock} fp={spec.spec_fingerprint[:12]}…"
-        )
-        return result
-
-    # 7. Atomic persistence + durable forensic enqueue.
-    try:
-        from db import queries
-
-        domain = (urlsplit(url).netloc or "unknown").lower()
-        warranty_tier = _map_warranty_tier(getattr(item, "warranty_claimed", None))
-
-        async with db_pool.acquire() as conn:  # type: ignore[attr-defined]
-            async with conn.transaction():
-                merchant_id = await queries.upsert_merchant(
-                    conn, domain=domain, display_name=domain
-                )
-                existing_id = await queries.lookup_by_fingerprint(
-                    conn, spec.spec_fingerprint
-                )
-                product_id = existing_id
-                if not product_id:
-                    product_id = await queries.insert_canonical_product(
-                        conn,
-                        spec_fingerprint=spec.spec_fingerprint,
-                        brand=spec.brand or item.brand,
-                        model_family=spec.model_family,
-                        sub_model=spec.sub_model,
-                        storage_gb=spec.storage_gb,
-                        ram_gb=spec.ram_gb,
-                        region_code=spec.region_code,
-                        raw_title=item.raw_title,
-                        clean_title=item.clean_title,
-                    )
-
-                listing_id = None
-                if product_id:
-                    listing_id = await queries.upsert_listing(
-                        conn,
-                        product_id=product_id,
-                        merchant_id=merchant_id,
-                        listing_url=url,
-                        price_lkr=item.price_lkr,
-                        warranty_tier=warranty_tier,
-                        in_stock=item.in_stock,
-                    )
-                    if listing_id:
-                        await queries.log_price_history(
-                            conn,
-                            listing_id=listing_id,
-                            price_lkr=item.price_lkr,
-                            in_stock=item.in_stock,
-                        )
-
-                if existing_id:
-                    result["status"] = "delta_updated"
-                elif product_id:
-                    # New product → enqueue durable forensic job (Track B input).
-                    await queries.enqueue_forensic_job(
-                        conn,
-                        product_id=product_id,
-                        merchant_id=merchant_id,
-                        listing_url=url,
-                    )
-                    result["status"] = "new_product_queued"
-
-        result["product_id"] = product_id
-        result["price_lkr"] = item.price_lkr
-        result["in_stock"] = item.in_stock
-        log.success(
-            f"[Ingest] {result['status']}: {item.clean_title} — "
-            f"LKR {item.price_lkr:,.2f} (fp={spec.spec_fingerprint[:12]}…)"
-        )
-    except Exception as exc:
-        result["status"] = "persist_failed"
-        result["notes"].append(f"db persist error: {exc}")
-        log.warn(f"[Ingest] persist failed for {url}: {exc}")
-
-    return result
+    # 2. Extract + persist via the single zero-selector authority.
+    return await extract_and_persist_html(
+        url, html, pool=db_pool, llm_pool=llm_pool, settings=settings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -616,35 +413,21 @@ async def cmd_crawl(urls: List[str], use_db: bool) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_worker(use_db: bool) -> None:
-    """Run the serial forensic worker until interrupted (SIGINT/SIGTERM)."""
-    from forensic_worker import run_worker_loop
+    """Run the full background worker until interrupted (SIGINT/SIGTERM).
+
+    Delegates to :func:`worker.run_worker`, which runs the crawl consumer
+    (headless-browser ``crawl_queue`` drainer, or the static httpx fallback
+    when Crawl4AI is absent) and the forensic consumer concurrently. This is
+    the process that actually consumes the queue the dashboard fills.
+    """
+    from worker import run_worker
 
     if not use_db:
         log.error("--worker requires --db (a PostgreSQL connection is mandatory for the queue).")
         return
 
-    try:
-        settings.require_api_key()
-    except RuntimeError as exc:
-        log.error(str(exc))
-        return
-
-    _, llm_pool = _build_llm_clients()
-    if llm_pool is None:
-        log.error("Cannot start worker: no LLM API keys available.")
-        return
-
-    db_pool = await _init_db()
-    if db_pool is None:
-        log.error("Cannot start worker: DB connection failed.")
-        return
-
-    try:
-        await run_worker_loop(db_pool, llm_pool, settings)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        log.warn("[Worker] Interrupted — shutting down gracefully.")
-    finally:
-        await _close_db(db_pool)
+    # worker.run_worker owns API-key/LLM/DB bootstrap and the two consumer loops.
+    await run_worker()
 
 
 # ---------------------------------------------------------------------------

@@ -157,34 +157,6 @@ def test_extract_track_a_never_raises_on_garbage():
 
 
 # ---------------------------------------------------------------------------
-# 4. Site-profile loading & domain resolution
-# ---------------------------------------------------------------------------
-
-def test_site_profiles_load_and_resolve():
-    from site_profiles import loader
-
-    profiles = loader.load_all_profiles(force=True)
-    assert len(profiles) >= 1
-    names = loader.list_profiles()
-    assert "default_generic" in names
-
-    # get_profile always returns something (generic fallback, never None).
-    generic = loader.get_profile("https://totally-unknown-store.example/x")
-    assert generic is not None
-    assert generic.name == "default_generic"
-
-
-def test_site_profile_domain_match():
-    from site_profiles.loader import SiteProfile
-
-    prof = SiteProfile(name="acme", domains=["acme.lk", "shop.acme.lk"])
-    # matches() returns a longest-suffix score (truthy on match, 0 on miss).
-    assert prof.matches("shop.acme.lk")
-    assert prof.matches("acme.lk")
-    assert not prof.matches("evil.com")
-
-
-# ---------------------------------------------------------------------------
 # 5. Forensic per-phase timeout + cumulative budget with partial commits
 # ---------------------------------------------------------------------------
 

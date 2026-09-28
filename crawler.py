@@ -9,8 +9,11 @@ Responsibilities:
   ``gc.collect()`` run after each batch.
 * **Gated pipeline** — every page flows fetch → hash → Sentry → branch, with a
   stealth re-fetch when a bot challenge is detected.
-* **Structured extraction** — verified product pages are parsed into a strictly
-  validated :class:`ScrapedProductItem` by Gemini Flash.
+* **Structured extraction** — verified product pages are handed to
+  :func:`auto_extractor.extract_and_persist_html`, the single zero-selector
+  extractor (JSON-LD → cached domain strategy → LLM) shared with the drip worker
+  and the CLI. This module owns fetch/classify/loop-guarding only; it no longer
+  authors its own extraction prompt.
 """
 
 from __future__ import annotations
@@ -25,13 +28,13 @@ from enum import Enum
 from typing import List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from auto_extractor import extract_and_persist_html
 from config import Settings, settings as default_settings
 from llm_pool import GeminiClient
 from logging_utils import log
 from schemas import (
     PageInspectionResult,
     PageTypeEnum,
-    ProductExtraction,
     ScrapedProductItem,
 )
 from sentry import SmartSentry
@@ -47,17 +50,6 @@ except Exception as _exc:  # pragma: no cover
     AsyncWebCrawler = BrowserConfig = CrawlerRunConfig = CacheMode = None  # type: ignore
     _CRAWL4AI_ERR = _exc
 
-
-EXTRACTION_SYSTEM_INSTRUCTION = (
-    "You extract structured e-commerce product data from the Markdown of a single "
-    "Sri Lankan (LKR) product page. Rules: return every price as a plain number "
-    "with no currency symbol, thousands separator, or spaces (e.g. 'Rs. 45,900' -> "
-    "45900). Use null for anything genuinely unknown — never invent values. "
-    "clean_title removes marketing noise (superlatives, emoji, 'FREE SHIPPING', "
-    "shouting caps) but keeps brand, model numbers and capacities. in_stock is "
-    "false for sold-out/unavailable items. Return only a few of the most important "
-    "specifications."
-)
 
 # Query params stripped during canonicalization (tracking/analytics junk).
 _TRACKING_KEYS = {
@@ -404,29 +396,6 @@ class AntiFragileCrawler:
         return ordered[: self._settings.max_children_per_category]
 
     # ------------------------------------------------------------------ #
-    # Structured extraction
-    # ------------------------------------------------------------------ #
-    async def extract_product(self, markdown: str, url: str) -> ScrapedProductItem:
-        """Parse Markdown into a validated product item (raises on bad data)."""
-        budget = min(len(markdown), self._settings.sentry_char_budget * 3)
-        prompt = (
-            f"Product URL: {url}\n"
-            "Extract the product from this page content:\n"
-            "----- BEGIN PAGE CONTENT -----\n"
-            f"{markdown[:budget]}\n"
-            "----- END PAGE CONTENT -----"
-        )
-        extraction = await self._llm.generate_structured(
-            prompt,
-            ProductExtraction,
-            system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
-            temperature=0.0,
-            max_output_tokens=1024,
-        )
-        # to_item() runs the strict validators (price finite & > 0, etc.).
-        return extraction.to_item(url)
-
-    # ------------------------------------------------------------------ #
     # The gated pipeline for one URL
     # ------------------------------------------------------------------ #
     async def process_url(self, url: str, depth: int = 0) -> PipelineResult:
@@ -526,30 +495,36 @@ class AntiFragileCrawler:
             log.gate("QUEUE", f"category grid → enqueuing {len(children)} child link(s)")
 
         elif pt in (PageTypeEnum.PRODUCT_PAGE, PageTypeEnum.OUT_OF_STOCK_PLACEHOLDER):
-            try:
-                item = await self.extract_product(markdown, canonical)
-                if pt == PageTypeEnum.OUT_OF_STOCK_PLACEHOLDER:
-                    item.in_stock = False
-                res.item = item
+            # Single extraction authority: the zero-selector cascade shared with
+            # the drip worker and CLI. It extracts AND persists atomically
+            # (dry-run no-op when db_pool is None), enqueuing forensics for new
+            # products. crawler.py no longer runs its own LLM-markdown path.
+            outcome = await extract_and_persist_html(
+                canonical, html,
+                pool=self._db_pool, llm_pool=self._llm_pool, settings=self._settings,
+            )
+            res.notes.extend(outcome.get("notes", []))
+            res.notes.append(f"autox_tier={outcome.get('tier')}")
+            status = outcome.get("status")
+            if status == "new_product_queued":
+                res.status = PipelineStatus.NEW_PRODUCT_QUEUED
+                log.gate("FORENSIC", f"new product queued (id={str(outcome.get('product_id'))[:8]}…) — "
+                                     f"run `python worker.py` to process")
+            elif status == "delta_updated":
+                res.status = PipelineStatus.DELTA_UPDATED
+            elif status in ("extracted_dry_run", "extracted"):
                 res.status = (
-                    PipelineStatus.OUT_OF_STOCK if not item.in_stock else PipelineStatus.EXTRACTED
+                    PipelineStatus.OUT_OF_STOCK if outcome.get("in_stock") is False
+                    else PipelineStatus.EXTRACTED
                 )
-                log.gate(
-                    "EXTRACT",
-                    f"'{item.clean_title}' — LKR {item.price_lkr:,.2f} "
-                    f"({'in stock' if item.in_stock else 'OUT OF STOCK'})",
-                )
-                # -------------------------------------------------------- #
-                # KALA-BALANA DB-aware fork (no-op when db_pool is None)
-                # -------------------------------------------------------- #
-                if self._db_pool is not None:
-                    await self._persist_product(item, canonical, res)
-            except Exception as exc:
-                # Strict validation failed (e.g. no positive price) — keep the
-                # classification but don't emit a bogus item.
+            else:  # extract_failed / validation_failed / persist_failed
                 res.status = PipelineStatus.CLASSIFIED_ONLY
-                res.notes.append(f"extraction/validation failed: {exc}")
-                log.gate("EXTRACT", f"validation failed, no item emitted: {exc}", ok=False)
+                log.gate("EXTRACT", f"no item emitted ({status})", ok=False)
+            price = outcome.get("price_lkr")
+            if price is not None:
+                log.gate("EXTRACT", f"LKR {price:,.2f} "
+                                    f"({'in stock' if outcome.get('in_stock') else 'OUT OF STOCK'}) "
+                                    f"via {outcome.get('tier')}")
 
         else:  # ERROR_404_PAGE / UNKNOWN_JUNK
             res.status = PipelineStatus.REJECTED
@@ -557,129 +532,6 @@ class AntiFragileCrawler:
 
         res.elapsed_s = time.perf_counter() - t0
         return res
-
-    # ------------------------------------------------------------------ #
-    # KALA-BALANA: DB persistence + forensics dispatcher
-    # ------------------------------------------------------------------ #
-    async def _persist_product(
-        self,
-        item: "ScrapedProductItem",
-        listing_url: str,
-        res: PipelineResult,
-    ) -> None:
-        """Persist a scraped product to PostgreSQL and dispatch forensics if new.
-
-        Case A — Existing product (fingerprint found):
-            Update listings.current_price_lkr and insert a price_history row.
-            Sets res.status = DELTA_UPDATED.
-
-        Case B — New product (fingerprint not found):
-            Insert into canonical_products as 'discovered', upsert the merchant
-            and listing rows, then launch run_forensic_pipeline as a background
-            asyncio task.
-            Sets res.status = NEW_PRODUCT_QUEUED.
-        """
-        from urllib.parse import urlsplit as _urlsplit
-
-        from db import queries
-        from normalizer import SpecNormalizer
-
-        try:
-            norm = SpecNormalizer()
-            spec = norm.normalize(item.raw_title, brand_hint=item.brand)
-
-            # Upsert merchant row from the listing URL's domain.
-            domain = (_urlsplit(listing_url).netloc or "unknown").lower()
-            merchant_id = await queries.upsert_merchant(
-                self._db_pool,
-                domain=domain,
-                display_name=domain,
-            )
-
-            existing_id = await queries.lookup_by_fingerprint(
-                self._db_pool, spec.spec_fingerprint
-            )
-
-            if existing_id:
-                # ---- Case A: Delta check -------------------------------- #
-                log.gate("DB", f"existing product (fp={spec.spec_fingerprint[:12]}…) — delta update")
-                listing_id = await queries.upsert_listing(
-                    self._db_pool,
-                    product_id=existing_id,
-                    merchant_id=merchant_id,
-                    listing_url=listing_url,
-                    price_lkr=item.price_lkr,
-                    in_stock=item.in_stock,
-                )
-                if listing_id:
-                    await queries.log_price_history(
-                        self._db_pool,
-                        listing_id=listing_id,
-                        price_lkr=item.price_lkr,
-                        in_stock=item.in_stock,
-                    )
-                res.status = PipelineStatus.DELTA_UPDATED
-                res.notes.append(
-                    f"delta: price=LKR {item.price_lkr:,.2f} "
-                    f"in_stock={item.in_stock} fingerprint={spec.spec_fingerprint[:16]}…"
-                )
-
-            else:
-                # ---- Case B: New product -------------------------------- #
-                log.gate("DB", f"NEW product detected — inserting + queuing forensics")
-                product_id = await queries.insert_canonical_product(
-                    self._db_pool,
-                    spec_fingerprint=spec.spec_fingerprint,
-                    brand=spec.brand or item.brand,
-                    model_family=spec.model_family,
-                    sub_model=spec.sub_model,
-                    storage_gb=spec.storage_gb,
-                    ram_gb=spec.ram_gb,
-                    region_code=spec.region_code,
-                    raw_title=item.raw_title,
-                    clean_title=item.clean_title,
-                )
-                if product_id:
-                    listing_id = await queries.upsert_listing(
-                        self._db_pool,
-                        product_id=product_id,
-                        merchant_id=merchant_id,
-                        listing_url=listing_url,
-                        price_lkr=item.price_lkr,
-                        in_stock=item.in_stock,
-                    )
-                    if listing_id:
-                        await queries.log_price_history(
-                            self._db_pool,
-                            listing_id=listing_id,
-                            price_lkr=item.price_lkr,
-                            in_stock=item.in_stock,
-                        )
-                    # Enqueue to the durable forensic_queue (consumed by the
-                    # standalone --worker process) rather than spawning an
-                    # unmanaged asyncio background task inside the crawl loop.
-                    if product_id:
-                        await queries.enqueue_forensic_job(
-                            self._db_pool,
-                            product_id=product_id,
-                            merchant_id=merchant_id,
-                            listing_url=listing_url,
-                        )
-                        log.gate(
-                            "FORENSIC",
-                            f"Job enqueued for {item.clean_title!r} "
-                            f"(id={product_id[:8]}…) — run `python main.py --worker` to process",
-                        )
-                res.status = PipelineStatus.NEW_PRODUCT_QUEUED
-                res.notes.append(
-                    f"new: fingerprint={spec.spec_fingerprint[:16]}… "
-                    f"brand={spec.brand} sub_model={spec.sub_model!r}"
-                )
-
-        except Exception as exc:
-            # DB errors must never crash the crawl loop.
-            log.warn(f"[DB persist] non-fatal error: {exc}")
-            res.notes.append(f"db_persist error (non-fatal): {exc}")
 
     # ------------------------------------------------------------------ #
     # Batch runner: bounded-concurrency BFS with category expansion

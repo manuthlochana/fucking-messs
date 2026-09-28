@@ -1,0 +1,39 @@
+# Generic fallback site profile for KALA-BALANA ingestion.
+#
+# Used when no domain-specific profile matches a product URL. The selectors
+# target the conventions shared by most WooCommerce / Shopify / generic
+# storefronts. Every selector is optional — when a selector misses, the
+# extractor falls back to its own text/regex heuristics.
+
+name: default_generic
+# Empty domains list == matches nothing explicitly; it is the catch-all fallback.
+domains: []
+selector_type: css
+
+selectors:
+  # Product title.
+  title: "h1, [itemprop='name'], .product-title, .product_title"
+  # Current selling price.
+  price: "[itemprop='price'], .price ins .amount, .price .amount, .product-price, .current-price"
+  # Pre-discount / RRP price.
+  original_price: "del .amount, .regular-price, .was-price, s .amount"
+  # Add-to-cart / buy button (its disabled state is a strong OOS signal).
+  stock_button: "button.add-to-cart, button[name='add'], .single_add_to_cart_button, .buy-now"
+  # Visible stock text / availability badge.
+  stock_text: ".stock, .availability, [itemprop='availability'], .inventory_status"
+  # Key/value specifications table.
+  specs_table: "table.specs, table.shop_attributes, .woocommerce-product-attributes, .product-specs"
+  # Bank / BNPL card-promo banners.
+  card_promo: ".promo, .bank-offer, .card-offer, .payment-banner, .installment-info"
+  # "Next page" pagination link for category grids.
+  pagination: "a.next, .pagination a, .page-numbers a, a[rel='next']"
+
+# Extra hints consumed opportunistically by the ingestion layer.
+currency: LKR
+# Prefer JSON-LD schema.org availability when present (most reliable stock signal).
+prefer_jsonld_availability: true
+# CSS selector to await before scraping (dynamic pages); null == no wait.
+wait_for: null
+notes: >
+  Catch-all profile. Add a domain-specific YAML (see sample_retailer.yaml) to
+  override any of these selectors for a particular Sri Lankan retailer.

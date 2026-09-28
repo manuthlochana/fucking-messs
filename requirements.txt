@@ -14,6 +14,7 @@ groq>=0.9.0              # Groq API client (optional, set GROQ_API_KEY to enable
 # Optional conveniences
 python-dotenv>=1.0.0      # load .env automatically
 redis>=5.0.0             # only needed if you set REDIS_URL for the hash ring
+PyYAML>=6.0              # site_profiles YAML loader (degrades gracefully if absent)
 
 # Dashboard & HTTP utilities
 fastapi>=0.110.0

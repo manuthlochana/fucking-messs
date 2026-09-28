@@ -18,9 +18,9 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +265,163 @@ class MerchantAudit(BaseModel):
         description="Map of payment method to detected surcharge percentage.",
     )
 
+
+
+# --------------------------------------------------------------------------- #
+# Track A extraction schemas (extractor.py) — BNPL, stock, promos, surcharges
+# --------------------------------------------------------------------------- #
+
+class BNPLPlan(BaseModel):
+    """A single Buy-Now-Pay-Later / installment plan and its *true* hidden cost.
+
+    The advertised teaser is usually the cash price; the real cost of taking the
+    installment plan is ``cycles * installment_amount``. ``markup_pct`` quantifies
+    the hidden surcharge relative to the honest cash price (blueprint §A3.29).
+    """
+
+    provider: str = Field(description="BNPL provider, e.g. 'koko', 'mintpay', 'payhere'.")
+    cycles: int = Field(description="Number of installments/payments.")
+    installment_amount: float = Field(description="Amount charged per installment (LKR).")
+    cash_price: float = Field(description="Advertised up-front cash price (LKR).")
+    total_payable: float = Field(default=0.0, description="cycles × installment_amount.")
+    markup_pct: float = Field(
+        default=0.0,
+        description="((cycles × installment) − cash_price) / cash_price × 100.",
+    )
+
+
+class StockVerification(BaseModel):
+    """Result of the 3-signal stock check (blueprint §A1.3).
+
+    Three independent signals are compared — the buy-button state, the
+    schema.org/JSON-LD ``availability`` metadata, and any stock text/badge.
+    Status only flips when at least **2 of 3** signals agree.
+    """
+
+    in_stock: Optional[bool] = Field(
+        default=None,
+        description="Verified stock state, or null when signals fail to reach 2-of-3 agreement.",
+    )
+    confidence: int = Field(
+        default=0,
+        description="Number of signals (0-3) that agreed with the winning verdict.",
+    )
+    agreement_reached: bool = Field(
+        default=False,
+        description="True when >=2 of 3 signals agreed (status may be updated).",
+    )
+    signals: Dict[str, Optional[bool]] = Field(
+        default_factory=dict,
+        description="Per-signal readings: {'button': bool|None, 'schema': bool|None, 'text': bool|None}.",
+    )
+
+
+class BankCardPromo(BaseModel):
+    """A local-bank credit-card promotion detected on a listing/merchant page."""
+
+    bank: str = Field(description="Bank name, e.g. 'Commercial Bank', 'HNB', 'Sampath'.")
+    discount_pct: Optional[float] = Field(default=None, description="Percentage discount, if stated.")
+    installment_months: Optional[int] = Field(default=None, description="0%-interest installment months, if stated.")
+    raw_text: str = Field(default="", description="The snippet the promo was extracted from.")
+
+
+class PaymentSurcharge(BaseModel):
+    """A payment surcharge / convenience fee added on top of the cash price."""
+
+    method: str = Field(description="Payment method the surcharge applies to, e.g. 'credit_card', 'bnpl', 'convenience_fee'.")
+    surcharge_pct: Optional[float] = Field(default=None, description="Surcharge as a percentage, if expressed that way.")
+    surcharge_lkr: Optional[float] = Field(default=None, description="Flat surcharge amount in LKR, if expressed that way.")
+    raw_text: str = Field(default="", description="The snippet the surcharge was extracted from.")
+
+
+class TrackAExtras(BaseModel):
+    """Container for the Track A commerce-forensics extracted from a listing DOM."""
+
+    bnpl_plans: List[BNPLPlan] = Field(default_factory=list)
+    stock: StockVerification = Field(default_factory=StockVerification)
+    bank_promos: List[BankCardPromo] = Field(default_factory=list)
+    surcharges: List[PaymentSurcharge] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Corroboration-gated defect record (Phase 3 app-layer, blueprint §A4.45)
+# --------------------------------------------------------------------------- #
+
+class DefectEntry(BaseModel):
+    """A defect promoted to a *widespread* classification only when corroborated.
+
+    Unlike the lenient LLM-facing :class:`DefectFinding`, ``DefectEntry`` enforces
+    the corroboration gate at the schema layer: a defect may only be labelled
+    ``confirmed_widespread`` when it cites **>= 2 independent sources**. Anything
+    with fewer sources is clamped down to ``isolated`` / ``corroborated`` so a
+    single unverified complaint can never be published as a widespread fault.
+    """
+
+    MIN_SOURCES_FOR_WIDESPREAD: ClassVar[int] = 2
+
+    category: str = Field(description="Defect category, e.g. 'thermal_throttling'.")
+    description: str = Field(description="Plain-language summary of the issue.")
+    severity: str = Field(default="moderate", description="critical, high, moderate, or low.")
+    corroborating_sources: List[str] = Field(
+        default_factory=list,
+        description="URLs / platform+thread identifiers of independent sources.",
+    )
+    severity_classification: str = Field(
+        default="isolated",
+        description="isolated | corroborated | confirmed_widespread (gated on source_count).",
+    )
+    affects_stock_config: bool = Field(default=True)
+    resolved_in_revision: Optional[str] = Field(default=None)
+
+    @property
+    def source_count(self) -> int:
+        return len(self.corroborating_sources)
+
+    @property
+    def is_widespread(self) -> bool:
+        return self.severity_classification == "confirmed_widespread"
+
+    @model_validator(mode="after")
+    def _enforce_corroboration_gate(self) -> "DefectEntry":
+        """Clamp the classification to what the evidence supports.
+
+        - 0-1 sources  -> 'isolated'          (never widespread, regardless of LLM claim)
+        - exactly gate -> 'corroborated'
+        - >= gate+? and caller asked widespread -> 'confirmed_widespread'
+        """
+        n = len(self.corroborating_sources)
+        gate = type(self).MIN_SOURCES_FOR_WIDESPREAD
+        if n < gate:
+            # Not enough independent corroboration: force down to isolated.
+            object.__setattr__(self, "severity_classification", "isolated")
+        elif self.severity_classification == "confirmed_widespread" and n < gate:
+            object.__setattr__(self, "severity_classification", "corroborated")
+        elif self.severity_classification not in (
+            "isolated",
+            "corroborated",
+            "confirmed_widespread",
+        ):
+            object.__setattr__(self, "severity_classification", "corroborated")
+        return self
+
+    @classmethod
+    def from_finding(cls, finding: "DefectFinding", widespread_if_gated: bool = True) -> "DefectEntry":
+        """Build a gated entry from a lenient LLM :class:`DefectFinding`."""
+        n = len(finding.corroborating_sources)
+        gate = cls.MIN_SOURCES_FOR_WIDESPREAD
+        if n >= gate:
+            classification = "confirmed_widespread" if widespread_if_gated else "corroborated"
+        else:
+            classification = "isolated"
+        return cls(
+            category=finding.category,
+            description=finding.description,
+            severity=finding.severity,
+            corroborating_sources=list(finding.corroborating_sources),
+            severity_classification=classification,
+            affects_stock_config=finding.affects_stock_config,
+            resolved_in_revision=finding.resolved_in_revision,
+        )
 
 
 class PredecessorComparison(BaseModel):

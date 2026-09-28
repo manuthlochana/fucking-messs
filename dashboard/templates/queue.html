@@ -72,6 +72,7 @@
                         <td class="py-4 px-4 text-right">
                             {% if j.status == 'failed' or j.status == 'claimed' %}
                             <form method="POST" action="/queue/retry/{{ j.id }}" class="inline">
+                                {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                                 <button type="submit" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 font-mono font-semibold transition border border-slate-700">
                                     Retry Job
                                 </button>

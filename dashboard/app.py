@@ -2,17 +2,37 @@
 
 Built with FastAPI + Jinja2 + Tailwind CSS (via CDN).
 Zero Node/React build bloat. Lightweight and memory-efficient.
+
+Security
+--------
+When ``ADMIN_DASHBOARD_KEY`` is set, every route requires HTTP Basic auth
+(username ``ADMIN_DASHBOARD_USER``, default ``admin``; password = the key) and
+the state-changing POST endpoints additionally require a CSRF token equal to the
+key, supplied as the ``csrf_token`` form field or the ``X-CSRF-Token`` header.
+When the key is unset the dashboard runs UNAUTHENTICATED (a loud warning is
+logged) — intended only for a trusted localhost session.
 """
 
 from __future__ import annotations
 
 import asyncio
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    status,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 
 from config import settings
@@ -27,10 +47,73 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 # Shared DB pool for the dashboard process
 db_pool: Optional[object] = None
 
+# ---------------------------------------------------------------------------
+# Authentication & CSRF
+# ---------------------------------------------------------------------------
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_auth(
+    credentials: Optional[HTTPBasicCredentials] = Depends(_basic),
+) -> Optional[str]:
+    """HTTP Basic gate. No-op (open) when no admin key is configured.
+
+    Uses constant-time comparison to avoid leaking the key via timing.
+    """
+    key = settings.admin_dashboard_key
+    if not key:
+        # Dashboard is open — acceptable only for trusted localhost use.
+        return None
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    user_ok = secrets.compare_digest(credentials.username, settings.admin_dashboard_user)
+    pass_ok = secrets.compare_digest(credentials.password, key)
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+def require_csrf(
+    csrf_token: Optional[str] = Form(default=None),
+    x_csrf_token: Optional[str] = Header(default=None),
+) -> None:
+    """Reject state-changing requests lacking a valid CSRF token.
+
+    The token equals the admin key and may arrive as the ``csrf_token`` form
+    field or the ``X-CSRF-Token`` header. Skipped entirely when no key is set.
+    """
+    key = settings.admin_dashboard_key
+    if not key:
+        return
+    supplied = csrf_token or x_csrf_token or ""
+    if not secrets.compare_digest(supplied, key):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing or invalid CSRF token.",
+        )
+
+
+def _csrf_value() -> str:
+    """Token value to embed in server-rendered forms (empty when auth off)."""
+    return settings.admin_dashboard_key or ""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
+    if not settings.admin_dashboard_key:
+        log.warn(
+            "[Dashboard] ADMIN_DASHBOARD_KEY is not set — dashboard is UNAUTHENTICATED. "
+            "Set it before exposing the dashboard beyond localhost."
+        )
     try:
         db_pool = await create_pool(
             settings.db_dsn,
@@ -53,6 +136,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="KALA-BALANA Hardware Intelligence Dashboard",
     lifespan=lifespan,
+    # Every route requires auth when a key is configured.
+    dependencies=[Depends(require_auth)],
 )
 
 
@@ -88,11 +173,12 @@ async def ingest_page(request: Request, message: Optional[str] = None):
         context={
             "active_page": "ingest",
             "message": message,
+            "csrf_token": _csrf_value(),
         },
     )
 
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=[Depends(require_csrf)])
 async def ingest_urls(
     background_tasks: BackgroundTasks,
     urls: str = Form(...),
@@ -168,12 +254,13 @@ async def queue_page(request: Request, status: Optional[str] = None):
             "active_page": "queue",
             "jobs": jobs,
             "current_status": status,
+            "csrf_token": _csrf_value(),
         },
     )
 
 
 
-@app.post("/queue/retry/{job_id}")
+@app.post("/queue/retry/{job_id}", dependencies=[Depends(require_csrf)])
 async def retry_queue_job(job_id: int):
     await queries.retry_failed_forensic_job(db_pool, job_id)
     return RedirectResponse(url="/queue", status_code=303)

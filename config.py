@@ -131,6 +131,20 @@ class Settings:
     db_pool_max_size: int = field(default_factory=lambda: _env_int("DB_POOL_MAX_SIZE", 5))
     db_pool_min_size: int = field(default_factory=lambda: _env_int("DB_POOL_MIN_SIZE", 1))
 
+    # --- Dashboard security ----------------------------------------------- #
+    # Shared secret gating the admin dashboard and its state-changing POST
+    # endpoints (ingest triggers, queue retries). When empty the dashboard runs
+    # UNAUTHENTICATED — safe only for a trusted localhost session. Set
+    # ADMIN_DASHBOARD_KEY in production. The username for HTTP Basic is fixed to
+    # ``admin``; the key is the password (and also accepted as a bearer/session
+    # token or CSRF form field).
+    admin_dashboard_key: Optional[str] = field(
+        default_factory=lambda: _env_str("ADMIN_DASHBOARD_KEY")
+    )
+    admin_dashboard_user: str = field(
+        default_factory=lambda: _env_str("ADMIN_DASHBOARD_USER", "admin")
+    )
+
     # --- Multi-Key LLM Pool ----------------------------------------------- #
     # Comma-separated list of Gemini keys. Falls back to gemini_api_key.
     gemini_api_keys_raw: Optional[str] = field(
@@ -188,6 +202,11 @@ class Settings:
     def sentry_char_budget(self) -> int:
         """Approximate character budget for the Sentry's LLM input slice."""
         return max(500, self.sentry_token_budget * self.chars_per_token)
+
+    @property
+    def dashboard_auth_enabled(self) -> bool:
+        """True when an admin key is configured (dashboard requires auth)."""
+        return bool(self.admin_dashboard_key)
 
     @property
     def gemini_api_keys(self) -> List[str]:

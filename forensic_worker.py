@@ -25,8 +25,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import quote_plus, urlsplit
 
 from config import Settings, settings as default_settings
@@ -44,6 +45,12 @@ try:
     from normalizer import NormalizedSpec
 except ImportError:
     NormalizedSpec = None  # type: ignore
+
+
+#: Cumulative wall-clock budget for the whole 5-phase pipeline (blueprint §2).
+#: Once elapsed exceeds this, remaining phases are skipped (not started) so the
+#: worker always makes forward progress and never blows past its slot.
+TOTAL_FORENSIC_BUDGET_S = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +84,10 @@ class ForensicReport:
     defects: List[Dict[str, Any]] = field(default_factory=list)
     merchant_audit: Dict[str, Any] = field(default_factory=dict)
     predecessor: Dict[str, Any] = field(default_factory=dict)
+    #: Per-phase wall-clock durations in seconds (phase label -> elapsed).
+    phase_timings: Dict[str, float] = field(default_factory=dict)
+    #: Phases skipped because the cumulative 300s budget was exhausted.
+    skipped_phases: List[str] = field(default_factory=list)
 
     @property
     def final_status(self) -> str:
@@ -569,6 +580,69 @@ async def _phase5_predecessor_comparison(
 # Main pipeline runner
 # ---------------------------------------------------------------------------
 
+async def _safe_update_status(
+    db_pool: Optional[object],
+    product_id: str,
+    status: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Update pipeline_status without ever letting a DB hiccup abort the pipeline."""
+    if db_pool is None:
+        return
+    try:
+        from db import queries
+
+        await queries.update_pipeline_status(
+            db_pool, product_id, status, extra_attributes=extra or {}
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warn(f"[Forensic] status update to {status!r} failed: {exc}")
+
+
+async def _run_phase_with_budget(
+    label: str,
+    coro_factory: "Callable[[], Awaitable[Any]]",
+    per_phase_timeout: float,
+    remaining_budget: float,
+    report: ForensicReport,
+) -> Optional[Any]:
+    """Run one phase under the *smaller* of its own timeout and the budget left.
+
+    Records the phase's wall-clock duration in ``report.phase_timings``. When the
+    cumulative 300s budget is already spent the phase is skipped (never started)
+    and recorded in ``report.skipped_phases``. Timeouts and exceptions are caught,
+    logged, and appended to ``report.errors`` — a phase failure never propagates.
+    Returns the phase result on success, else ``None``.
+    """
+    effective = min(per_phase_timeout, remaining_budget)
+    if effective <= 0:
+        report.skipped_phases.append(label)
+        log.warn(f"[Forensic] {label} SKIPPED — cumulative {TOTAL_FORENSIC_BUDGET_S:.0f}s budget exhausted.")
+        return None
+
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(coro_factory(), timeout=effective)
+        elapsed = time.monotonic() - started
+        report.phase_timings[label] = round(elapsed, 2)
+        log.gate("FORENSIC", f"  ✓ {label} done in {elapsed:.1f}s")
+        return result
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started
+        report.phase_timings[label] = round(elapsed, 2)
+        msg = f"{label} timed out after {elapsed:.1f}s (budget {effective:.0f}s)"
+        report.errors.append(msg)
+        log.warn(f"[Forensic] {msg}")
+        return None
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        report.phase_timings[label] = round(elapsed, 2)
+        msg = f"{label} failed after {elapsed:.1f}s: {exc}"
+        report.errors.append(msg)
+        log.warn(f"[Forensic] {msg}")
+        return None
+
+
 async def run_forensic_pipeline(
     ctx: ForensicContext,
     db_pool: Optional[object],
@@ -579,179 +653,148 @@ async def run_forensic_pipeline(
 
     Fully fault-tolerant: each phase is wrapped in a try/except with an
     ``asyncio.wait_for`` timeout. Phase data is persisted to the DB after each
-    phase so partial results survive a crash.
+    phase so partial results survive a crash. A cumulative 300s budget caps the
+    whole run — once exhausted, remaining phases are skipped rather than started.
     """
-    from db import queries
-
     report = ForensicReport(product_id=ctx.product_id)
     spec = ctx.spec
     product_name = f"{spec.brand} {spec.model_family} {spec.sub_model}".strip().title()
 
+    started_at = time.monotonic()
+
+    def remaining() -> float:
+        """Seconds left in the cumulative 300s pipeline budget."""
+        return TOTAL_FORENSIC_BUDGET_S - (time.monotonic() - started_at)
+
     log.gate("FORENSIC", f"Starting 5-phase pipeline for: {product_name}")
-    log.gate("FORENSIC", f"  product_id={ctx.product_id} | total_budget=300s")
+    log.gate("FORENSIC", f"  product_id={ctx.product_id} | total_budget={TOTAL_FORENSIC_BUDGET_S:.0f}s")
 
     # ------------------------------------------------------------------ #
     # Phase 1 — Ground Truth (60s)
     # ------------------------------------------------------------------ #
     log.gate("FORENSIC", "[Phase 1/5] Ground Truth Specs (60s budget)…")
-    try:
-        report.ground_truth = await asyncio.wait_for(
-            _phase1_ground_truth(ctx, db_pool, llm_pool, settings),
-            timeout=settings.forensic_phase1_timeout_s,
-        )
+    res = await _run_phase_with_budget(
+        "Phase 1 Ground Truth",
+        lambda: _phase1_ground_truth(ctx, db_pool, llm_pool, settings),
+        settings.forensic_phase1_timeout_s, remaining(), report,
+    )
+    if res is not None:
+        report.ground_truth = res
         report.phase1_done = True
-        await queries.update_pipeline_status(
+        await _safe_update_status(
             db_pool, ctx.product_id, "phase1_done",
-            extra_attributes={"ground_truth": report.ground_truth},
+            {"ground_truth": report.ground_truth},
         )
-        msrp = report.ground_truth.get("launch_msrp_usd")
-        chip = report.ground_truth.get("chipset", "?")
-        log.gate("FORENSIC", f"  ✓ Phase 1 done | MSRP=${msrp} | Chip={chip}")
-    except asyncio.TimeoutError:
-        msg = "Phase 1 timed out after 60s"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
-    except Exception as exc:
-        msg = f"Phase 1 failed: {exc}"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
+        log.gate(
+            "FORENSIC",
+            f"  MSRP=${report.ground_truth.get('launch_msrp_usd')} | "
+            f"Chip={report.ground_truth.get('chipset', '?')}",
+        )
 
     # ------------------------------------------------------------------ #
     # Phase 2 — FX Arbitrage (60s)
     # ------------------------------------------------------------------ #
     log.gate("FORENSIC", "[Phase 2/5] FX Arbitrage & Price Classification (60s budget)…")
-    try:
-        report.arbitrage = await asyncio.wait_for(
-            _phase2_fx_arbitrage(ctx, db_pool, llm_pool, settings, report.ground_truth),
-            timeout=settings.forensic_phase2_timeout_s,
-        )
+    res = await _run_phase_with_budget(
+        "Phase 2 FX Arbitrage",
+        lambda: _phase2_fx_arbitrage(ctx, db_pool, llm_pool, settings, report.ground_truth),
+        settings.forensic_phase2_timeout_s, remaining(), report,
+    )
+    if res is not None:
+        report.arbitrage = res
         report.phase2_done = True
-        await queries.update_pipeline_status(
+        await _safe_update_status(
             db_pool, ctx.product_id, "phase2_done",
-            extra_attributes={"arbitrage": report.arbitrage},
+            {"arbitrage": report.arbitrage},
         )
-        label = report.arbitrage.get("price_label", "unknown")
-        markup = report.arbitrage.get("markup_pct")
-        log.gate("FORENSIC", f"  ✓ Phase 2 done | label={label} | markup={markup}%")
-    except asyncio.TimeoutError:
-        msg = "Phase 2 timed out after 60s"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
-    except Exception as exc:
-        msg = f"Phase 2 failed: {exc}"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
+        log.gate(
+            "FORENSIC",
+            f"  label={report.arbitrage.get('price_label', 'unknown')} | "
+            f"markup={report.arbitrage.get('markup_pct')}%",
+        )
 
     # ------------------------------------------------------------------ #
     # Phase 3 — Defect Mining (90s)
     # ------------------------------------------------------------------ #
     log.gate("FORENSIC", "[Phase 3/5] Reddit Defect Mining (90s budget)…")
-    try:
-        report.defects = await asyncio.wait_for(
-            _phase3_defect_mining(ctx, db_pool, llm_pool, settings),
-            timeout=settings.forensic_phase3_timeout_s,
-        )
+    res = await _run_phase_with_budget(
+        "Phase 3 Defect Mining",
+        lambda: _phase3_defect_mining(ctx, db_pool, llm_pool, settings),
+        settings.forensic_phase3_timeout_s, remaining(), report,
+    )
+    if res is not None:
+        report.defects = res
         report.phase3_done = True
-        await queries.update_pipeline_status(
+        await _safe_update_status(
             db_pool, ctx.product_id, "phase3_done",
-            extra_attributes={"defect_count": len(report.defects)},
+            {"defect_count": len(report.defects)},
         )
-        log.gate("FORENSIC", f"  ✓ Phase 3 done | {len(report.defects)} confirmed defect(s)")
-    except asyncio.TimeoutError:
-        msg = "Phase 3 timed out after 90s"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
-    except Exception as exc:
-        msg = f"Phase 3 failed: {exc}"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
+        log.gate("FORENSIC", f"  {len(report.defects)} confirmed defect(s)")
 
     # ------------------------------------------------------------------ #
     # Phase 4 — Merchant Forensics (60s)
     # ------------------------------------------------------------------ #
     log.gate("FORENSIC", "[Phase 4/5] Merchant Forensic Audit (60s budget)…")
-    try:
-        report.merchant_audit = await asyncio.wait_for(
-            _phase4_merchant_audit(ctx, db_pool, llm_pool, settings),
-            timeout=settings.forensic_phase4_timeout_s,
-        )
+    res = await _run_phase_with_budget(
+        "Phase 4 Merchant Audit",
+        lambda: _phase4_merchant_audit(ctx, db_pool, llm_pool, settings),
+        settings.forensic_phase4_timeout_s, remaining(), report,
+    )
+    if res is not None:
+        report.merchant_audit = res
         report.phase4_done = True
-        await queries.update_pipeline_status(
+        await _safe_update_status(
             db_pool, ctx.product_id, "phase4_done",
-            extra_attributes={"merchant_audit": report.merchant_audit},
+            {"merchant_audit": report.merchant_audit},
         )
-        patterns = report.merchant_audit.get("dark_patterns", [])
-        authorized = report.merchant_audit.get("is_authorized_agent", False)
         log.gate(
             "FORENSIC",
-            f"  ✓ Phase 4 done | authorized={authorized} | dark_patterns={patterns}"
+            f"  authorized={report.merchant_audit.get('is_authorized_agent', False)} | "
+            f"dark_patterns={report.merchant_audit.get('dark_patterns', [])}",
         )
-    except asyncio.TimeoutError:
-        msg = "Phase 4 timed out after 60s"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
-    except Exception as exc:
-        msg = f"Phase 4 failed: {exc}"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
 
     # ------------------------------------------------------------------ #
     # Phase 5 — Predecessor Comparison (30s)
     # ------------------------------------------------------------------ #
     log.gate("FORENSIC", "[Phase 5/5] Predecessor Comparison (30s budget)…")
-    try:
-        report.predecessor = await asyncio.wait_for(
-            _phase5_predecessor_comparison(ctx, db_pool, llm_pool, settings, report.ground_truth),
-            timeout=settings.forensic_phase5_timeout_s,
-        )
+    res = await _run_phase_with_budget(
+        "Phase 5 Predecessor",
+        lambda: _phase5_predecessor_comparison(ctx, db_pool, llm_pool, settings, report.ground_truth),
+        settings.forensic_phase5_timeout_s, remaining(), report,
+    )
+    if res is not None:
+        report.predecessor = res
         report.phase5_done = True
-        await queries.update_pipeline_status(
-            db_pool, ctx.product_id, "complete",
-            extra_attributes={"predecessor_comparison": report.predecessor},
-        )
         verdict = report.predecessor.get("verdict") or report.predecessor.get("upgrade_verdict", "?")
-        log.gate("FORENSIC", f"  ✓ Phase 5 done | upgrade_verdict={verdict}")
-    except asyncio.TimeoutError:
-        msg = "Phase 5 timed out after 30s"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
-    except Exception as exc:
-        msg = f"Phase 5 failed: {exc}"
-        report.errors.append(msg)
-        log.warn(f"[Forensic] {msg}")
+        log.gate("FORENSIC", f"  upgrade_verdict={verdict}")
 
     # ------------------------------------------------------------------ #
     # Final status evaluation
     # ------------------------------------------------------------------ #
-    phases_done = sum(
-        1 for i in range(1, 6) if getattr(report, f"phase{i}_done")
+    total_elapsed = time.monotonic() - started_at
+    phases_done = sum(1 for i in range(1, 6) if getattr(report, f"phase{i}_done"))
+
+    log.gate(
+        "FORENSIC",
+        f"  Pipeline elapsed={total_elapsed:.1f}s | timings={report.phase_timings} | "
+        f"skipped={report.skipped_phases}",
     )
 
     if phases_done == 5:
         log.success(
-            f"[Forensic] Pipeline COMPLETE for {product_name} | all 5 phases succeeded."
+            f"[Forensic] Pipeline COMPLETE for {product_name} | all 5 phases succeeded "
+            f"in {total_elapsed:.1f}s."
         )
-        if db_pool is not None:
-            try:
-                await queries.update_pipeline_status(db_pool, ctx.product_id, "complete")
-            except Exception:
-                pass
+        await _safe_update_status(db_pool, ctx.product_id, "complete")
     elif phases_done > 0:
         log.warn(
-            f"[Forensic] Pipeline PARTIAL for {product_name} | {phases_done}/5 phases succeeded."
+            f"[Forensic] Pipeline PARTIAL for {product_name} | {phases_done}/5 phases "
+            f"succeeded in {total_elapsed:.1f}s."
         )
-        if db_pool is not None:
-            try:
-                await queries.update_pipeline_status(db_pool, ctx.product_id, "partial")
-            except Exception:
-                pass
+        await _safe_update_status(db_pool, ctx.product_id, "partial")
     else:
         log.error(f"[Forensic] Pipeline FAILED for {product_name} | 0 phases succeeded.")
-        if db_pool is not None:
-            try:
-                await queries.update_pipeline_status(db_pool, ctx.product_id, "failed")
-            except Exception:
-                pass
+        await _safe_update_status(db_pool, ctx.product_id, "failed")
 
     return report
 
